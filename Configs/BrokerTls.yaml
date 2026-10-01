@@ -1,0 +1,9 @@
+address: 127.0.0.1
+port: 5601
+tls: true
+certificate: ../Targets/Certificates/certificate.pem
+private_key: ../Targets/Certificates/private-key.pem
+authority: ../Targets/Certificates/authority.pem
+mutual_tls: false
+require_auth: true
+auth_key_env: EMPY_AUTH_KEY

@@ -1,0 +1,7 @@
+{
+    "recommendations": [
+        "ms-vscode.cpptools-extension-pack",
+        "wayou.vscode-todo-highlight",
+        "pkief.material-icon-theme"
+    ]
+}

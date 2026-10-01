@@ -1,0 +1,24 @@
+# Local TCP development profile.
+address: 127.0.0.1
+port: 5600
+workers: 1
+max_sessions: 1024
+max_profiles: 256
+max_inflight: 256
+max_packet_bytes: 1048576
+max_send_bytes: 4194304
+max_session_bytes: 4194304
+max_retained_bytes: 16777216
+max_retained_topics: 4096
+max_requests: 256
+max_responders: 64
+session_expiry_seconds: 300
+keepalive_seconds: 30
+handshake_timeout_ms: 5000
+retry_interval_ms: 500
+max_retries: 5
+request_timeout_ms: 5000
+tls: false
+quic: false
+require_auth: false
+allow_remote_plaintext: false

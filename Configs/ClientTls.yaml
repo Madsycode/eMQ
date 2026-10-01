@@ -1,0 +1,7 @@
+tls: true
+authority: ../Targets/Certificates/authority.pem
+server_name: localhost
+auth_key_env: EMPY_AUTH_KEY
+# Client authentication by certificate, when required by the broker:
+# certificate: ../Targets/Certificates/client.pem
+# private_key: ../Targets/Certificates/client-key.pem

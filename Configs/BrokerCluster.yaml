@@ -1,0 +1,42 @@
+# Copy for broker1/broker2, changing both ports, identifier, paths and state directory.
+# Replace every fingerprint before use. See docs/CLUSTERING.md.
+address: 127.0.0.1
+port: 5600
+max_replay_bytes: 16777216
+cluster:
+    identifier: broker0
+    address: 127.0.0.1
+    port: 5700
+    state_directory: ../Targets/State/broker0
+    epoch: 1
+    shards: 4
+    replicas: 3
+    fanout: 2
+    lease_ms: 3000
+    rpc_timeout_ms: 700
+    max_state_bytes: 268435456
+    max_records: 65536
+    max_operations: 1024
+    max_packet_bytes: 16777216
+    max_send_bytes: 67108864
+    quic: true
+    certificate: ../Targets/Certificates/broker0.pem
+    private_key: ../Targets/Certificates/broker0.key
+    authority: ../Targets/Certificates/authority.pem
+    epoch_key_env: EMPY_CLUSTER_KEY
+    peers:
+        - identifier: broker0
+          host: 127.0.0.1
+          port: 5700
+          server_name: localhost
+          fingerprint: REPLACE_WITH_BROKER0_CERTIFICATE_SHA256
+        - identifier: broker1
+          host: 127.0.0.1
+          port: 5701
+          server_name: localhost
+          fingerprint: REPLACE_WITH_BROKER1_CERTIFICATE_SHA256
+        - identifier: broker2
+          host: 127.0.0.1
+          port: 5702
+          server_name: localhost
+          fingerprint: REPLACE_WITH_BROKER2_CERTIFICATE_SHA256

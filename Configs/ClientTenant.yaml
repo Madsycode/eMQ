@@ -1,0 +1,6 @@
+tls: true
+authority: ../Targets/Certificates/authority.pem
+server_name: localhost
+auth_identity: alpha
+auth_key_env: EMPY_ALPHA_AUTH_KEY
+# Topics must be inside alpha, for example alpha/sensors/temperature.

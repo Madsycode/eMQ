@@ -1,0 +1,13 @@
+{
+    "name": "Development network",
+    "intervalMs": 1000,
+    "timeoutMs": 1500,
+    "historySamples": 300,
+    "brokers": [
+        {
+            "id": "local",
+            "name": "Local broker",
+            "url": "http://127.0.0.1:5601"
+        }
+    ]
+}

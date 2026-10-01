@@ -1,0 +1,10 @@
+# Loopback development listener with broker restart recovery.
+address: 127.0.0.1
+port: 5600
+state_directory: ../Targets/State/standalone
+max_state_bytes: 268435456
+max_replay_bytes: 16777216
+max_inflight: 256
+max_session_bytes: 4194304
+session_expiry_seconds: 300
+keepalive_seconds: 30

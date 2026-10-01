@@ -1,0 +1,16 @@
+address: 127.0.0.1
+port: 5601
+tls: true
+certificate: ../Targets/Certificates/certificate.pem
+private_key: ../Targets/Certificates/private-key.pem
+authority: ../Targets/Certificates/authority.pem
+state_directory: ../Targets/State/tenants
+tenants:
+    - identity: alpha
+      root: alpha
+      auth_key_env: EMPY_ALPHA_AUTH_KEY
+    - identity: beta
+      root: beta
+      auth_key_env: EMPY_BETA_AUTH_KEY
+# In a cluster, optional shards: [0, 1] restricts a tenant to those logical shards.
+# Wildcard profiles require every potentially matching shard in that allowlist.

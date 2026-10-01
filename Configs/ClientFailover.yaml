@@ -1,0 +1,16 @@
+# Client-facing transport is separate from the broker backplane.
+# Start with --host 127.0.0.1 --port 5600.
+auto_reconnect: true
+reconnect_interval_ms: 250
+operation_timeout_ms: 15000
+session_expiry_seconds: 300
+keepalive_seconds: 30
+failover_endpoints:
+    - host: 127.0.0.1
+      port: 5601
+    - host: 127.0.0.1
+      port: 5602
+# With an externally provisioned payload key, enable a directory unique to this client:
+# payload_key_env: EMPY_PAYLOAD_KEY
+# payload_state_directory: ../Targets/State/client-a-payload
+# key_epoch: 1

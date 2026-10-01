@@ -1,0 +1,32 @@
+{
+  "version": "0.2.0",
+  "configurations": [              
+    // Windows
+    {
+      "args": [],
+      "MIMode": "gdb",
+      "type": "cppdbg", 
+      "request": "launch",
+      "stopAtEntry": false,
+      "name": "EmpyBroker.exe",
+      "preLaunchTask": "Debug",
+      "externalConsole": false,
+      "cwd": "${workspaceFolder}/Targets/Build/Debug",
+      "miDebuggerPath": "C:/msys64/ucrt64/bin/gdb.exe",
+      "program": "${workspaceFolder}/Targets/Build/Debug/EmpyBroker.exe",
+    },
+    {
+      "args": [],
+      "MIMode": "gdb",
+      "type": "cppdbg", 
+      "request": "launch",
+      "stopAtEntry": false,
+      "name": "EmpyKlient.exe",
+      "preLaunchTask": "Debug",
+      "externalConsole": false,
+      "cwd": "${workspaceFolder}/Targets/Build/Debug",
+      "miDebuggerPath": "C:/msys64/ucrt64/bin/gdb.exe",
+      "program": "${workspaceFolder}/Targets/Build/Debug/EmpyKlient.exe",
+    }
+  ]
+}

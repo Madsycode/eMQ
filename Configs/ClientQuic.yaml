@@ -1,0 +1,8 @@
+quic: true
+quic_strategy: 3
+bulk_streams: 2
+bulk_threshold_bytes: 65536
+datagram_threshold_bytes: 1200
+authority: ../Targets/Certificates/authority.pem
+server_name: localhost
+auth_key_env: EMPY_AUTH_KEY

@@ -1,0 +1,9 @@
+# Local broker with an opt-in, read-only HTTP telemetry listener.
+address: 127.0.0.1
+port: 5600
+telemetry:
+  address: 127.0.0.1
+  port: 5601
+  interval_ms: 1000
+  max_sessions: 1024
+  # token_env: EMPY_TELEMETRY_TOKEN

@@ -1,0 +1,20 @@
+# Local TCP development profile.
+tls: false
+quic: false
+reason_strings: true
+session_expiry_seconds: 300
+keepalive_seconds: 30
+max_packet_bytes: 1048576
+max_send_bytes: 4194304
+max_pending_bytes: 4194304
+max_inflight: 256
+max_profiles: 256
+handshake_timeout_ms: 5000
+retry_interval_ms: 500
+operation_timeout_ms: 5000
+# Optional E2E provisioning, exclusively on participating clients:
+# payload_key_env: EMPY_PAYLOAD_KEY
+# key_epoch: 1
+# minimum_key_epoch: 1
+# maximum_key_epoch: 1
+# key_subtree: tenant/room
