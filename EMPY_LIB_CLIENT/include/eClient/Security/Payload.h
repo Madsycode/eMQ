@@ -39,6 +39,9 @@ namespace eMQ
         std::array<uint8_t, 16> Next();
         void Save(Writer& writer) const;
         void Load(Reader& reader);
+        EMPY_INLINE const std::array<uint8_t, 8>& Prefix() const { return m_Prefix; }
+        EMPY_INLINE uint64_t Counter() const { return m_Counter; }
+        EMPY_INLINE bool Exhausted() const { return m_Exhausted; }
 
     private:
         std::array<uint8_t, 8> m_Prefix{};
@@ -49,7 +52,8 @@ namespace eMQ
     struct EMPY_CLIENT_API PayloadCipher
     {
         PayloadCipher(KeyGrant grant, uint32_t minimumEpoch, uint32_t maximumEpoch,
-            size_t cacheLimit = 128, size_t replayLimit = 4096, std::string stateDirectory = {});
+            size_t cacheLimit = 128, size_t replayLimit = 4096, std::string stateDirectory = {},
+            uint64_t nonceReservation = 1024);
         ~PayloadCipher();
         PayloadCipher(const PayloadCipher&) = delete;
         PayloadCipher& operator=(const PayloadCipher&) = delete;

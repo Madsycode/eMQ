@@ -150,10 +150,24 @@ namespace eMQ
             maxPacket(packetLimit), maxProfiles(profileLimit), reasons(includeReasons) {}
     };
 
+    // Routing view of an encoded frame; the topic refers into the frame bytes.
+    struct PacketSummary
+    {
+        uint8_t type = 0;
+        uint8_t qos = 0;
+        size_t payload = 0;
+        std::string_view topic;
+        EMPY_INLINE bool Publication() const { return type == MMQP_PACKET_PUBREQ; }
+    };
+
     struct EMPY_MQ_API Codec
     {
         static Message Decode(std::span<const uint8_t> bytes, CodecOptions options = {});
+        // Reads the fixed and publication headers only; it does not validate the body.
+        static PacketSummary Peek(std::span<const uint8_t> bytes, CodecOptions options = {});
         static Buffer Encode(const Message& message, CodecOptions options = {});
+        // Encodes a publication whose payload is held elsewhere; header.payload must be empty.
+        static Buffer Encode(const PublishRequest& header, CodecOptions options, std::span<const uint8_t> payload);
         static uint8_t Type(const Message& message);
     };
 }

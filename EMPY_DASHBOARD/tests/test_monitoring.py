@@ -60,6 +60,12 @@ class ConfigTests(unittest.TestCase):
         self.assertNotIn(token, repr(config))
         self.assertNotIn(token, json.dumps(Collector(config).state()))
 
+    def test_large_fabrics_are_supported_up_to_the_source_limit(self):
+        brokers = [{"id": f"b{i}", "url": f"http://127.0.0.1:{6000 + i}"} for i in range(256)]
+        self.assertEqual(len(self.configuration({"brokers": brokers}).sources), 256)
+        with self.assertRaises(ValueError):
+            self.configuration({"brokers": brokers + [{"id": "extra", "url": "http://127.0.0.1:7000"}]})
+
     def test_missing_token_fails_closed(self):
         with patch.dict(os.environ, {}, clear=True), self.assertRaises(ValueError):
             self.configuration({"brokers": [{"id": "node", "url": "http://localhost:5601", "tokenEnv": "MISSING"}]})
@@ -166,6 +172,55 @@ class CollectorTests(unittest.TestCase):
         self.assertEqual(collector.state(now=2)["sources"][1]["state"], "online")
 
 
+def session(identifier, online=True, **counts):
+    value = {"identifier": identifier, "realm": "", "transport": "TCP", "online": online, "authenticated": False,
+             "resumable": True, "owner": True, "idleMs": 0, "expiresInMs": None, "lease": None}
+    for key in ("receivedPackets", "receivedBytes", "sentPackets", "sentBytes", "observedAt", "publications", "deliveries",
+                "keepaliveSeconds", "subscriptions", "registrations", "responders", "requesters", "pending", "pendingBytes",
+                "queuedBytes", "replay", "replayBytes", "requests", "responseRoutes"):
+        value[key] = counts.get(key, 0)
+    return value
+
+
+class SessionQueryTests(unittest.TestCase):
+    def setUp(self):
+        self.sources = (Source("a", "Alpha", "http://127.0.0.1:5601"), Source("b", "Beta", "http://127.0.0.1:5602"))
+        self.collector = Collector(Settings("Fabric", self.sources))
+        for index, source in enumerate(self.sources):
+            data = snapshot(instance=f"boot-{index}")
+            data["sessions"] = [session(f"{source.identifier}-{i:02}", online=i % 3 != 0, subscriptions=1, requests=1)
+                                for i in range(30)]
+            data["metrics"]["sessions"] = 30
+            data["metrics"]["online"] = 20
+            self.collector.accept(source, (validate(data), 1, None), now=1, timestamp=1000)
+
+    def test_state_carries_summaries_not_session_lists(self):
+        values = self.collector.state(now=1)["sources"]
+        self.assertNotIn("sessions", values[0]["data"])
+        self.assertEqual(values[0]["data"]["requests"], 30)
+        self.assertEqual(values[0]["data"]["observedSessions"], 30)
+        self.assertEqual(len(values[0]["data"]["preview"]), 6)
+        self.assertTrue(all(item["online"] for item in values[0]["data"]["preview"]))
+        self.assertEqual(values[0]["data"]["preview"][0]["roles"], ["Subscriber"])
+
+    def test_filters_pages_and_ordering(self):
+        result = self.collector.sessions(now=1, size=25)
+        self.assertEqual((result["total"], result["observed"], result["pages"]), (60, 60, 3))
+        self.assertEqual([row["state"] for row in result["rows"][:2]], ["online", "online"])
+        offline = self.collector.sessions(state="offline", broker="b", now=1)
+        self.assertEqual(offline["total"], 10)
+        self.assertTrue(all(row["source"]["id"] == "b" for row in offline["rows"]))
+        self.assertEqual(self.collector.sessions(search="ALPHA", size=100, now=1)["total"], 30)
+        self.assertEqual(self.collector.sessions(role="Responder", now=1)["total"], 0)
+        self.assertEqual(self.collector.sessions(page=99, now=1)["page"], 2)
+
+    def test_unreachable_sources_report_unknown_sessions(self):
+        self.collector.accept(self.sources[1], (None, None, "unreachable"), now=2, timestamp=2000)
+        self.assertEqual(self.collector.sessions(state="unknown", now=2)["total"], 30)
+        self.assertEqual(self.collector.session("b/b-01", now=2)["state"], "unknown")
+        self.assertIsNone(self.collector.session("b/missing", now=2))
+
+
 class HttpTests(unittest.TestCase):
     def setUp(self):
         self.collector = Collector(Settings("Test fabric", (Source("node", "Test node", "http://127.0.0.1:5601"),)))
@@ -196,6 +251,15 @@ class HttpTests(unittest.TestCase):
                 self.assertEqual(headers["Cache-Control"], "no-store")
                 self.assertIn("frame-ancestors 'none'", headers["Content-Security-Policy"])
         self.assertEqual(json.loads(self.get("/api/state")[2])["name"], "Test fabric")
+
+    def test_session_api_validates_queries(self):
+        status, _, body = self.get("/api/sessions?state=online&page=0&size=10")
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body)["total"], 0)
+        for path in ("/api/sessions?state=bogus", "/api/sessions?page=-1", "/api/sessions?size=abc", "/api/sessions?state=a&state=b"):
+            with self.subTest(path=path):
+                self.assertEqual(self.get(path)[0], 400)
+        self.assertEqual(self.get("/api/session?key=node/missing")[0], 404)
 
     def test_no_file_traversal_or_writes(self):
         for path in ("/../config.py", "/%2e%2e/config.py", "/config.py", "/web/index.html"):

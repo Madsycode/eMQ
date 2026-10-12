@@ -107,6 +107,7 @@ namespace eMQ
             this->Blob({reinterpret_cast<const uint8_t*>(text.data()), text.size()});
         }
 
+        EMPY_INLINE void Reserve(size_t bytes) { m_Data.reserve(std::min(bytes, m_Limit)); }
         EMPY_INLINE const Buffer& Data() const { return m_Data; }
         EMPY_INLINE Buffer Take() { return std::move(m_Data); }
 

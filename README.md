@@ -126,6 +126,15 @@ publishers, subscribers and RPC clients:
 python EMPY_DASHBOARD/demo.py --bin Targets/Build/Debug --openssl openssl
 ```
 
+To test clustering at scale, deploy 10 to 256 local brokers with generated
+certificates, drive them with the built-in load generator and get a throughput,
+loss, latency and resource report. A comma list runs a sweep:
+
+```sh
+python EMPY_DASHBOARD/cluster.py --brokers 100 --bin Targets/BuildRelease/Release --openssl openssl
+python EMPY_DASHBOARD/cluster.py --brokers 3,10,30,100 --no-dashboard --rate 2 --openssl openssl
+```
+
 Read the [dashboard guide](docs/DASHBOARD.md) for multi-broker configuration,
 remote collection, telemetry tokens, metric definitions and testing commands.
 The dashboard remains independent of the client application and never receives
@@ -179,7 +188,7 @@ the broker's PUBACK. Neither future waits for application responses.
 - REG QoS selects retention: 0 is last value, 1 is bounded FIFO. Only QoS 1 publications are retained. `Register(topic, 1, expirySeconds, queueSize)` selects FIFO; the default selects last value.
 - Wildcards use complete `+` levels or terminal `#`. Shared subscriptions use `$share/<group>/<filter>`. Ordinary root wildcards exclude reserved `$` topics.
 - PRT REQ/RES alone selects the mandatory two-byte request ID (`correlationId`) at QoS 0/1, independently of the QoS packet ID. The former COR bit is reserved and must be zero. Requests on the same topic run concurrently; IDs are nonzero and never reused within a SID, and exhaustion requires a fresh session. No-responder and timeout results preserve the originating ID. Deploy matched peers; ordinary MSG encoding is unchanged. Persistent schema upgrade requirements are in [CLUSTERING.md](docs/CLUSTERING.md).
-- Publication and profile PIDs never wrap. Establish a fresh session after 65,535 operations in a PID namespace. Alias namespaces are also finite.
+- Publication PIDs wrap after 65,535 using serial-number arithmetic, so a session continues indefinitely. Profile PIDs never wrap; establish a fresh session after 65,535 profile requests. Alias namespaces are also finite.
 - A PUBACK confirms bounded protocol acceptance. Application callbacks and durable business transactions are separate. A durable broker checkpoint does not make an application's external side effects exactly once.
 - The cipher uses a bounded 256-counter replay window per topic, epoch and random publisher prefix. A very late unseen envelope outside that window is rejected. Nonce/replay state persists only when its state directory is enabled.
 

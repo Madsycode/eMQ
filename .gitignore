@@ -30,9 +30,11 @@
 *.exe
 *.out
 *.app
+*.tex
+*.pdf
+
 
 # Files
-docs/latex/
 build/
 Targets/
 CMakeUserPresets.json

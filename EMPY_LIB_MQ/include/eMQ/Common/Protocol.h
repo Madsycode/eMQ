@@ -13,6 +13,7 @@ inline constexpr char MMQP_TOPIC_DELIMETER = '/';
 // protocol configs
 inline constexpr unsigned char MMQP_STRLEN_SIZE = 1;
 inline constexpr unsigned char MMQP_FIXED_LEN = 1;
+inline constexpr unsigned char MMQP_TOKEN_SIZE = 32; // CONREQ token and CONSYN HMAC-SHA256 response
 
 // protocol alias
 inline constexpr const char* MMQP_ALIAS = "MMQP";

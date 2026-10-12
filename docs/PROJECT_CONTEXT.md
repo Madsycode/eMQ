@@ -8,6 +8,160 @@ clustering and ECS-based runtime. The user's five-directory layering is binding.
 Use [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md) to locate each feature and
 [PROTOCOL_DECISIONS.md](PROTOCOL_DECISIONS.md) before changing wire behavior.
 
+## Scalable dashboard and local cluster tests, 2026-10-12
+
+F26/F27: `EMPY_DASHBOARD/cluster.py` deploys 1 to 256 real brokers on one host,
+with generated per-broker pinned certificates, isolated ports, state and logs. It
+drives `EmpyKlient bench` load generators and writes `report.json`/`report.md`,
+or `sweep.json`/`sweep.md` for a comma list of sizes. `demo.py` is now its
+three-broker preset. The bench mode (`EMPY_IMPL_CLIENT/src/Bench.cpp`) runs many
+publishers and subscribers per process, embeds send time and sequence in each
+payload, and reports accepted and delivered rates, loss, duplicates, reordering
+and mergeable latency histograms. See [DASHBOARD.md](DASHBOARD.md).
+
+The dashboard now accepts 256 sources and polls at most 32 concurrently. Browsers
+receive compact per-broker summaries; sessions are queried server side through
+`/api/sessions` (filtered pages) and `/api/session`. Above 12 brokers, the
+topology becomes a ring with load halos that draws only the selection's live
+links and one-sided links. The Brokers view is a searchable, sortable table. The
+overview adds a message-rate card and active links of n(n−1)/2 possible. Backplane
+links are dialed on demand, so idle peers are shown as normal, not as failures.
+
+The first 10-broker benchmark exposed the reliable cluster path's ceiling.
+Profiling under load drove these changes:
+- **Group commit per transport read:** one checkpoint per TCP/TLS read or QUIC
+  stream/datagram event, released before its ACKs and deliveries. Connections
+  gain `onFlush`.
+- **QoS 0 batching:** remote transient deliveries are drained as one transaction.
+- **Concurrent inbox acknowledgements:** with idle inbox polling backing off
+  from 150 ms to 2 s.
+- **Retained-queue updates:** the lock record and shard index are written
+  concurrently, and the release is not awaited.
+- **Journaled cluster store:** one flushed append per replica write instead of
+  a flushed file replacement, compacted into an atomic snapshot. A replica
+  write fell from about 10 ms to 2.7 ms.
+
+Measured on this host (16 cores, one SSD), Release, TLS backplane, QoS 1, 128 B,
+20 publishers and 20 subscribers on 20 topics at 2 publications/s each:
+
+| Brokers | Active links | Accepted/s | Delivered/s | Lost | Dup | p50 ms | p99 ms | Broker RSS MiB | Broker CPU % |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 3 | 3 / 3 | 40.0 | 40.0 | 0 | 0 | 323.6 | 407.4 | 54 | 1.8 |
+| 10 | 45 / 45 | 40.0 | 40.0 | 0 | 0 | 173.8 | 251.2 | 171 | 2.7 |
+| 30 | 245 / 435 | 40.0 | 40.0 | 0 | 0 | 89.1 | 154.9 | 513 | 3.2 |
+| 100 | 362 / 4950 | 40.0 | 40.0 | 0 | 0 | 74.1 | 263.0 | 1513 | 5.0 |
+
+All 100 brokers listened within 1.9 s and reported within 0.2 s more. Ten brokers
+sustained about 96 reliable publications per second without loss (p50 186 ms)
+and saturated beyond that. Before these changes the same 10-broker run accepted
+about 1.5 per second. The remaining limit is architectural: each QoS 1
+publication still waits synchronously on about six quorum round-trips inside the
+broker's single protocol thread, with CPU below 10%. An asynchronous admission
+pipeline, replica group commit and a per-topic retention owner are the next
+steps. These are single-host functional measurements, not distributed benchmarks.
+
+Verification: Debug and Release built with no warnings. All 11 CTest suites
+passed, including new journaled-store migration, replay and compaction checks.
+Dashboard tests passed: 28 Python and 9 JavaScript. The process smoke test passed
+against the Release binaries. The 10-check browser suite passed against a live
+30-broker deployment (`Targets/DashboardQA/cluster30`).
+
+```powershell
+python EMPY_DASHBOARD/cluster.py --brokers 3,10,30,100 --no-dashboard --duration 30 `
+    --publishers 20 --subscribers 20 --topics 20 --rate 2 `
+    --openssl C:/Libraries/msys64/ucrt64/bin/openssl.exe --bin Targets/BuildRelease/Release
+```
+
+## Wrapping publication PIDs, 2026-10-12
+
+F13 no longer ends a session after 65,535 QoS 1 publications in one direction.
+`PublicationSequence`, `ReceiveWindow` and `PendingQueue` in
+`eMQ/Common/State.h` keep 64-bit sequences and send their 16-bit wire form
+(1..65535). Receivers classify PIDs by serial distance from the checkpoint;
+[PROTOCOL_DECISIONS.md](PROTOCOL_DECISIONS.md) gives the rules. The broker and
+client receipt caches, pending retry order, PUBACK checks and the cluster origin
+sequence all use the 64-bit value. The wire format is unchanged. Session
+snapshots advance to ESS5 with 64-bit sequences; ESS4 is still loaded, because
+its 16-bit values never wrapped. The manifest schema stays 4, so all members must
+run the same build, because an older member rejects ESS5 snapshots.
+
+The manuscript replacement text is in [PidWraparound.tex](PidWraparound.tex).
+New `protocol` tests cover the wire mapping, both receive windows across the wrap
+in any arrival order, pending order and admission, and legacy window loading.
+The `integration` suite sends 66,235 QoS 1 publications through one session.
+Both the publisher-to-broker and broker-to-subscriber PIDs wrap, delivery stays
+in order with no duplicates, and the same SID resumes afterwards.
+
+## Paper conformance and realtime performance, 2026-10-12
+
+The code was audited against all sections of the paper (`IoT_Framework.pdf`):
+wire tables, session/QoS/alias rules, E2E encryption, the QUIC binding and the
+MHF formulas. Packet layouts, TIE, HKDF/AAD/nonce construction, rendezvous and
+tree formulas, UMID, leases and the MHF/2 envelope already matched. The fixes
+and performance work below changed no packet layout except the 32-byte token
+check. They changed no snapshot, manifest or MHF format, and no cluster RPC
+except the paged Scan.
+
+Conformance and correctness fixes:
+- F04/F07: CONREQ and CONSYN tokens must be exactly 32 bytes (Tables 3 and 5).
+- F08/F11/F13 client: a bounded PID-to-content receipt cache (conflicting or
+  unverifiable duplicates are errors). Token-bearing CONSYN is rejected while
+  Active, new broker-assigned aliases must be at least 32768, and the client
+  detects broker silence after twice the KAI. `stopping` is atomic, and the
+  transport admission check is consistent.
+- F17: the public `Derive` now checks cipher availability.
+- F21-F25 cluster: paged replica scans (shards and inboxes larger than one
+  packet failed before). Per-session inbox byte and record budgets (Section
+  IV-J), Consume replica/quarantine checks and broker-consistent
+  `TenantPolicy::Allows`.
+
+Realtime performance:
+- Local routing uses a level trie (`TopicTree`) over subscription filters
+  instead of scanning every session and reparsing every filter per publication.
+  Candidates are re-checked against the session profile. `MatchTopic` and
+  `SplitShared` are allocation-free hot-path forms of `TopicMatches`.
+- Standalone persistence journals only changed state per commit (EBR5 base and
+  EBJ1 journal, see [CLUSTERING.md](CLUSTERING.md)). It no longer rewrites and
+  flushes the whole broker snapshot on every QoS 1 publication. `FileStore`
+  gains `Append`/`Journal`/`Reset`, the non-copying `Find` and an ordered
+  prefix `Keys`.
+- Cipher state uses block nonce reservation and per-tuple replay records, so it
+  no longer rewrites everything per message. Ascon runs outside the lock, the
+  key cache is LRU and per-message allocations are reduced.
+- Retained publications update their queue in place, without copying the queue
+  or sweeping every topic. QoS 0 deliveries encode from the source payload, and
+  frames are built in one exact allocation.
+- Whole frames are decoded from the read buffer without copying. TCP gathers up
+  to 64 queued packets per write, and TLS stages small packets into one record.
+  QUIC chooses and validates channels with a header-only `Codec::Peek`, so each
+  packet is decoded once instead of twice.
+- Cluster: concurrent inbox fan-out and shard profile writes, condition-variable
+  quorum waits, precomputed replica lists, one forward encoding at ingress and
+  in-place relay MAC rebinding.
+
+Verification with QUIC enabled: all targets built with no warnings, and 11/11
+CTest suites passed in `Targets/Debug` and `Targets/BuildRelease`. The full
+Debug suite passed two further consecutive runs. New tests cover
+trie/matcher equivalence against the previous matcher, header peeks for every
+PRT block, token sizes, fragmented framing bounds, torn and damaged journals,
+journal compaction followed by restart, client receipts, CONSYN, alias and
+keep-alive behavior, cipher nonce reservation and migration, scan paging and
+inbox budgets. No benchmark was run; the performance changes reduce work per
+message but are not measured results. The TCP-only build and the process smoke
+harnesses were not rerun.
+
+```powershell
+$env:PATH = 'C:\Libraries\msys64\ucrt64\bin;' + $env:PATH
+cmake --build Targets/Debug --parallel 8
+ctest --test-dir Targets/Debug --output-on-failure
+cmake --build Targets/BuildRelease --parallel 8
+ctest --test-dir Targets/BuildRelease --output-on-failure
+```
+
+Remaining recommendations: a per-shard match index on profile replicas, group
+commit for cluster record flushes, and a shared ref-counted payload for fan-out.
+Also an independent interoperability peer and recorded benchmarks.
+
 ## PRT-selected request IDs, 2026-10-12
 
 F04/F15 now use the existing PRT values to determine the request-ID field.
@@ -258,7 +412,7 @@ to the Core event loop. Never mutate an EnTT registry from arbitrary pool jobs.
 | --- | --- |
 | Core lifecycle | `EMPY_LIB_CORE/include/eCore/Runtime/{Service,Context,Module,Runtime}.h` |
 | Entities/events/configuration | `eCore/Common/ECS.h`, `eCore/Auxiliaries/YAML.h` |
-| Wire format | `EMPY_LIB_MQ/include/eMQ/Common/{Protocol,Stream,Message,Topic}.h`, matching `src/Common` files |
+| Wire format and topic index | `EMPY_LIB_MQ/include/eMQ/Common/{Protocol,Stream,Message,Topic}.h` (`TopicTree`, `Codec::Peek`), matching `src/Common` files |
 | Protocol state | `eMQ/Common/State.h`, `src/Common/State.cpp`, `eMQ/Common/Events.h` |
 | TCP/TLS | `eMQ/Network/{Connection,IOContext}.h`, `src/Network/IOContext.cpp` |
 | QUIC | `eMQ/Network/{QContext,QuicPolicy}.h`, matching `src/Network` files |
@@ -284,18 +438,18 @@ adds live routing, ownership/failover and persistence. Read
 | IDs | Current state |
 | --- | --- |
 | F01-F02 | Shared dependency chain repaired; owner-thread ECS/event dispatch, lifecycle and module cleanup implemented |
-| F03-F05 | Nine typed packet codecs, bounded incremental framing, strict fields/topics/UTF-8 and exact TIE conversion implemented |
-| F06-F11 | Session state machines, resumption, HMAC, negotiated limits, keepalive, wills, atomic profiles and directional aliases implemented |
-| F12-F15 | Local/cross-broker pub/sub and shared groups, QoS checkpoints/retries, FIFO/last retention, bounded replay, and concurrent request/response with PRT-selected IDs and durable requester/responder mappings implemented |
-| F16-F17 | NIST Ascon-AEAD128, HMAC/HKDF, delegated keys, epoch/cache wiping, nonces/replay windows and optional durable cipher state implemented; hardware key services are deployment integrations |
-| F18 | Asynchronous TCP and TLS 1.3 implemented and tested with real sockets |
+| F03-F05 | Nine typed packet codecs, bounded incremental zero-copy framing, header peek, strict fields/topics/UTF-8, 32-byte tokens and exact TIE conversion implemented |
+| F06-F11 | Session state machines, resumption, HMAC, negotiated limits, broker keepalive plus client silence detection, wills, atomic profiles and range-checked directional aliases implemented |
+| F12-F15 | Trie-indexed local and cross-broker pub/sub and shared groups, wrapping 64-bit publication sequences, client and broker receipt caches, QoS checkpoints/retries, FIFO/last retention, bounded replay, and concurrent request/response with PRT-selected IDs and durable requester/responder mappings implemented |
+| F16-F17 | NIST Ascon-AEAD128, HMAC/HKDF, delegated keys, LRU key cache with wiping, nonces/replay windows and optional durable cipher state with block nonce reservation implemented; hardware key services are deployment integrations |
+| F18 | Asynchronous TCP and TLS 1.3 with write coalescing implemented and tested with real sockets |
 | F19 | Optional MsQuic transport with SAS 1/4/3, datagrams, bulk streams and verified credentials implemented; custom SAS 0 and broader platform/path testing remain |
 | F20-F22 | Live PSR/SSR placement, quorum profile snapshots/queries, tree forwarding and inbox recovery implemented; OR-set deltas remain a reusable component, while live convergence uses fenced snapshots |
 | F23 | Static authenticated membership, majority leases, durable fencing/adoption, session snapshots, minority refusal and automatic SID takeover implemented; online membership migration is outside this binding |
-| F24 | Bounded atomic FileStore, FileDurabilityStore, broker checkpoints, replicated inboxes/tombstones and retained queues, expiry compaction and restart recovery implemented |
+| F24 | Bounded atomic FileStore with journals, FileDurabilityStore, journaled standalone broker checkpoints, per-session inbox budgets, paged replica scans, replicated inboxes/tombstones and retained queues, expiry compaction and restart recovery implemented |
 | F25 | Live pinned B2B mTLS/QUIC, epoch MACs, tenant authentication identities/roots/shard allowlists and persistent token replay records implemented |
-| F26 | Typed configuration, CLI modes, opt-in bounded telemetry, live dark topology/metrics/session dashboard, activity/history/export and real cluster demo implemented |
-| F27 | Golden/vector, runtime, network and cluster-component tests exist; independent interoperability, sanitizer/stress and scientific benchmarks remain |
+| F26 | Typed configuration, CLI modes, opt-in bounded telemetry, live dark dashboard scaling to 256 brokers (server-side session queries, ring topology, sortable broker table), activity/history/export, real cluster demo and `cluster.py` deployments implemented |
+| F27 | Golden/vector, runtime, network and cluster-component tests, plus a single-host 1..256-broker load and sweep harness with loss/latency reports; independent interoperability, sanitizer runs and multi-host benchmarks remain |
 
 Do not claim arbitrary online reconfiguration, Byzantine consensus, persistent
 exactly-once business effects or reproduction of the paper's performance results.
@@ -317,9 +471,10 @@ exactly-once business effects or reproduction of the paper's performance results
   App callbacks run on the owner thread. Handle callback exceptions in the
   application; they propagate from `Poll`. Never wait on an I/O future from the
   protocol executor itself.
-- PIDs and alias maps survive in-memory reconnects. PID exhaustion, unsafe
+- PIDs and alias maps survive in-memory reconnects. Publication PIDs wrap after
+  65,535 using 64-bit sequences and serial arithmetic. Profile-ID exhaustion, unsafe
   profile acknowledgement ambiguity and expired holes in QUIC receive windows
-  require a fresh session. There is no automatic PID wrap. Broker snapshots
+  still require a fresh session. Broker snapshots
   preserve protocol state, but a new client process still establishes a fresh SID.
 - `PayloadCipher` belongs exclusively to clients. The broker never needs a
   payload root key. Keep auth credentials separate. Provision grants and accepted

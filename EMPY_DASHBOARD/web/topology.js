@@ -1,7 +1,19 @@
-import { Svg, Roles, Topology, EMPY_GRAPH_LIMIT } from "./model.js";
+import { Svg, Topology, EMPY_GRAPH_LIMIT, EMPY_DETAIL_NODES } from "./model.js";
+
+// Large fabrics use one ring sized for about 46 units per broker.
+function Ring(count)
+{
+    const radius = Math.max(220, count * 46 / (2 * Math.PI));
+    return Array.from({ length: count }, (_, index) =>
+    {
+        const angle = -Math.PI / 2 + index * 2 * Math.PI / count;
+        return { x: radius + 110 + Math.cos(angle) * radius, y: radius + 70 + Math.sin(angle) * radius };
+    });
+}
 
 function Positions(count, compact)
 {
+    if (count > EMPY_DETAIL_NODES) return Ring(count);
     if (compact && count <= 3)
     {
         if (count === 1) return [{ x: 260, y: 205 }];
@@ -83,16 +95,23 @@ export class NetworkGraph
         const focused = this.m_Element.contains(document.activeElement) ? document.activeElement.dataset.source : null;
         const model = Topology(sources);
         model.nodes = model.nodes.slice(0, EMPY_GRAPH_LIMIT);
+        const large = model.nodes.length > EMPY_DETAIL_NODES;
         const visible = new Set(model.nodes.map(node => node.key));
-        model.edges = model.edges.filter(edge => visible.has(edge.from) && visible.has(edge.to));
+        const chosen = model.nodes.find(node => node.source?.id === selected)?.key;
+        // Links are dialed on demand, so most pairs of a large fabric are idle. Large views draw
+        // the selection's live links and asymmetric links that only one broker reports.
+        model.edges = model.edges.filter(edge => visible.has(edge.from) && visible.has(edge.to)
+            && (!large || (edge.state === "connected" ? edge.from === chosen || edge.to === chosen : edge.observed)));
         const compact = this.m_Element.clientWidth < 550;
         this.m_Element.classList.toggle("compact", compact);
+        this.m_Element.classList.toggle("large", large);
         const positions = Positions(model.nodes.length, compact);
         const points = new Map(model.nodes.map((node, index) => [node.key, positions[index]]));
         const key = `${compact}/` + model.nodes.map(node => node.key).join("|");
         if (key !== this.m_Key)
         {
-            this.m_Bounds = [0, 0, Math.max(compact ? 520 : 900, ...positions.map(point => point.x + (compact ? 130 : 180))), Math.max(420, ...positions.map(point => point.y + 135))];
+            const margin = large ? 110 : compact ? 130 : 180;
+            this.m_Bounds = [0, 0, Math.max(compact ? 520 : 900, ...positions.map(point => point.x + margin)), Math.max(420, ...positions.map(point => point.y + (large ? 70 : 135)))];
             this.m_Key = key;
             this.Fit();
         }
@@ -106,32 +125,11 @@ export class NetworkGraph
                 : edge.observed ? "Link reported by one broker; opposite observation unavailable or different" : "No current connected link confirmed"));
             fragment.append(line);
         }
+        const busiest = Math.max(1, ...model.nodes.map(node => node.source?.rates?.publications || 0));
         model.nodes.forEach((node, index) =>
         {
             const point = positions[index];
-            if (showClients)
-            {
-                const sessions = [...node.clients].sort((a, b) => Number(b.online) - Number(a.online) || a.identifier.localeCompare(b.identifier));
-                const displayed = sessions.slice(0, 6);
-                const angles = model.nodes.length === 3 ? [[-165, -125, -80, 155, -40, 110], [-100, -55, -15, 25, 75, -145], [15, 55, 100, 155, 185, -5]][index] : null;
-                displayed.forEach((session, clientIndex) =>
-                {
-                    const angle = (angles ? angles[clientIndex] : -165 + clientIndex * 360 / Math.max(3, displayed.length)) * Math.PI / 180;
-                    const radius = compact && model.nodes.length > 1 ? 78 : model.nodes.length === 1 ? 130 : 101;
-                    const x = point.x + Math.cos(angle) * radius, y = point.y + Math.sin(angle) * radius;
-                    fragment.append(Svg("line", { x1: point.x, y1: point.y, x2: x, y2: y, class: "client-edge" }));
-                    const client = Svg("g");
-                    const online = session.online && node.state === "online";
-                    client.append(Svg("circle", { cx: x, cy: y, r: 9, class: `client-dot ${online ? "" : "offline"}` }));
-                    client.append(Svg("circle", { cx: x, cy: y, r: 2, fill: online ? "#92c1df" : "#7f8591" }));
-                    const roles = Roles(session);
-                    client.append(Svg("text", { x, y: y + 23, class: "client-caption" }, `${roles[0].slice(0, 3).toLowerCase()} · ${session.identifier.slice(0, 4)}`));
-                    client.append(Svg("title", {}, `${session.identifier}\n${roles.join(", ")}\n${node.state === "online" ? (session.online ? "Online" : "Offline / resumable") : "State unknown: broker telemetry unavailable"}`));
-                    fragment.append(client);
-                });
-                if (sessions.length > displayed.length)
-                    fragment.append(Svg("text", { x: point.x, y: point.y + 78, class: "node-caption" }, `+${sessions.length - displayed.length} more sessions`));
-            }
+            if (showClients && !large) this.Clients(fragment, node, point, model.nodes.length, index, compact);
             const group = Svg("g", { class: `graph-node ${node.state === "online" ? "" : "unavailable"} ${node.source?.id === selected ? "selected" : ""}` });
             if (node.source)
             {
@@ -141,15 +139,28 @@ export class NetworkGraph
                 group.setAttribute("aria-label", `Inspect ${node.name}, ${node.state}`);
                 group.setAttribute("aria-pressed", String(node.source.id === selected));
             }
-            group.append(Svg("circle", { cx: point.x, cy: point.y, r: 42, class: "node-halo" }));
-            group.append(Svg("rect", { x: point.x - 24, y: point.y - 24, width: 48, height: 48, rx: 12, class: "node-body" }));
-            const icon = Svg("svg", { x: point.x - 12, y: point.y - 12, width: 24, height: 24, viewBox: "0 0 24 24", class: "node-symbol", fill: "none", stroke: "currentColor", "stroke-width": 1.3 });
-            icon.append(Svg("use", { href: "#i-server" }));
-            group.append(icon);
-            group.append(Svg("text", { x: point.x, y: point.y + 48, class: "node-name" }, node.name.length > 23 ? node.name.slice(0, 21) + "…" : node.name));
-            group.append(Svg("text", { x: point.x, y: point.y + 63, class: "node-caption" }, node.source?.data
-                ? `${node.state === "online" ? node.source.data.metrics.online : "?"} clients · ${node.source.data.transport}` : node.state));
-            group.append(Svg("title", {}, `${node.name}\n${node.identifier}\n${node.state}`));
+            const data = node.source?.data;
+            const caption = data ? `${node.state === "online" ? data.metrics.online : "?"} clients · ${data.transport}` : node.state;
+            if (large)
+            {
+                // Halo size follows the broker's share of the busiest publication rate.
+                const load = (node.source?.rates?.publications || 0) / busiest;
+                group.append(Svg("circle", { cx: point.x, cy: point.y, r: 14 + load * 10, class: "node-halo load" }));
+                group.append(Svg("circle", { cx: point.x, cy: point.y, r: 10, class: "node-body" }));
+                if (model.nodes.length <= 48 || node.source?.id === selected)
+                    group.append(Svg("text", { x: point.x, y: point.y + 27, class: "node-name small" }, node.name.length > 14 ? node.name.slice(0, 13) + "…" : node.name));
+            }
+            else
+            {
+                group.append(Svg("circle", { cx: point.x, cy: point.y, r: 42, class: "node-halo" }));
+                group.append(Svg("rect", { x: point.x - 24, y: point.y - 24, width: 48, height: 48, rx: 12, class: "node-body" }));
+                const icon = Svg("svg", { x: point.x - 12, y: point.y - 12, width: 24, height: 24, viewBox: "0 0 24 24", class: "node-symbol", fill: "none", stroke: "currentColor", "stroke-width": 1.3 });
+                icon.append(Svg("use", { href: "#i-server" }));
+                group.append(icon);
+                group.append(Svg("text", { x: point.x, y: point.y + 48, class: "node-name" }, node.name.length > 23 ? node.name.slice(0, 21) + "…" : node.name));
+                group.append(Svg("text", { x: point.x, y: point.y + 63, class: "node-caption" }, caption));
+            }
+            group.append(Svg("title", {}, `${node.name}\n${node.identifier}\n${node.state}${data ? "\n" + caption : ""}`));
             fragment.append(group);
         });
         this.m_Element.replaceChildren(fragment);
@@ -159,5 +170,28 @@ export class NetworkGraph
             node?.focus({ preventScroll: true });
         }
         this.ApplyView();
+    }
+
+    Clients(fragment, node, point, count, index, compact)
+    {
+        const sessions = node.clients;
+        const angles = count === 3 ? [[-165, -125, -80, 155, -40, 110], [-100, -55, -15, 25, 75, -145], [15, 55, 100, 155, 185, -5]][index] : null;
+        sessions.forEach((session, clientIndex) =>
+        {
+            const angle = (angles ? angles[clientIndex] : -165 + clientIndex * 360 / Math.max(3, sessions.length)) * Math.PI / 180;
+            const radius = compact && count > 1 ? 78 : count === 1 ? 130 : 101;
+            const x = point.x + Math.cos(angle) * radius, y = point.y + Math.sin(angle) * radius;
+            fragment.append(Svg("line", { x1: point.x, y1: point.y, x2: x, y2: y, class: "client-edge" }));
+            const client = Svg("g");
+            const online = session.online && node.state === "online";
+            client.append(Svg("circle", { cx: x, cy: y, r: 9, class: `client-dot ${online ? "" : "offline"}` }));
+            client.append(Svg("circle", { cx: x, cy: y, r: 2, fill: online ? "#92c1df" : "#7f8591" }));
+            client.append(Svg("text", { x, y: y + 23, class: "client-caption" }, `${session.roles[0].slice(0, 3).toLowerCase()} · ${session.identifier.slice(0, 4)}`));
+            client.append(Svg("title", {}, `${session.identifier}\n${session.roles.join(", ")}\n${node.state === "online" ? (session.online ? "Online" : "Offline / resumable") : "State unknown: broker telemetry unavailable"}`));
+            fragment.append(client);
+        });
+        const total = node.source?.data?.metrics.sessions || 0;
+        if (total > sessions.length)
+            fragment.append(Svg("text", { x: point.x, y: point.y + 78, class: "node-caption" }, `+${total - sessions.length} more sessions`));
     }
 }

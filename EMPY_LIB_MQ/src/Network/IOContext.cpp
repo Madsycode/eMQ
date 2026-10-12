@@ -39,6 +39,9 @@ namespace eMQ
             FrameStream decoder;
             std::array<uint8_t, 8192> input{};
             std::deque<Buffer> output;
+            std::vector<asio::const_buffer> gather;
+            Buffer staging;
+            size_t inflight = 0;
             size_t queued = 0;
             bool closed = false;
             bool draining = false;
@@ -128,6 +131,7 @@ namespace eMQ
                         {
                             if (!self->closed && !self->draining && self->onReceive) self->onReceive(frame);
                         });
+                        if (!self->closed && self->onFlush) self->onFlush();
                     }
                     catch (const std::exception& failure) { self->Fail(failure.what()); return; }
                     self->Read();
@@ -148,17 +152,42 @@ namespace eMQ
 
             void Write()
             {
+                // Coalesce queued packets: one gathered write for TCP, and one staged TLS
+                // record for small TLS packets, instead of a syscall/record per packet.
+                constexpr size_t batchLimit = 64;
+                constexpr size_t byteLimit = 64 * 1024;
+                constexpr size_t recordLimit = 16 * 1024;
+                size_t bytes = 0;
+                inflight = 0;
+                for (const auto& item : output)
+                {
+                    if (inflight == batchLimit || (inflight && bytes + item.size() > (options.tls ? recordLimit : byteLimit))) break;
+                    ++inflight;
+                    bytes += item.size();
+                }
                 auto complete = [self = Self()] (asio::error_code error, size_t)
                 {
                     if (self->closed) return;
                     if (error) { self->Fail(error.message()); return; }
-                    self->queued -= self->output.front().size();
-                    self->output.pop_front();
+                    for (; self->inflight; --self->inflight)
+                    {
+                        self->queued -= self->output.front().size();
+                        self->output.pop_front();
+                    }
                     if (!self->output.empty()) self->Write();
                     else if (self->draining) self->Fail("Connection closed");
                 };
-                if (options.tls) asio::async_write(stream, asio::buffer(output.front()), std::move(complete));
-                else asio::async_write(stream.next_layer(), asio::buffer(output.front()), std::move(complete));
+                if (options.tls)
+                {
+                    if (inflight == 1) { asio::async_write(stream, asio::buffer(output.front()), std::move(complete)); return; }
+                    staging.clear();
+                    for (size_t i = 0; i < inflight; ++i) staging.insert(staging.end(), output[i].begin(), output[i].end());
+                    asio::async_write(stream, asio::buffer(staging), std::move(complete));
+                    return;
+                }
+                gather.clear();
+                for (size_t i = 0; i < inflight; ++i) gather.emplace_back(asio::buffer(output[i]));
+                asio::async_write(stream.next_layer(), gather, std::move(complete));
             }
 
             void Close(bool drain) override

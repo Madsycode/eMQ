@@ -81,7 +81,7 @@ h1 { font-size: 26px; letter-spacing: -0.7px; font-weight: 550; margin: 0; line-
 .button.subtle { background: transparent; border-color: var(--border); color: var(--muted); }
 .button[aria-pressed="true"] { color: var(--amber); border-color: #806944; }
 .notice { margin: -7px 0 18px; border: 1px solid #5d492e; border-radius: 5px; background: #292215; color: #e5c99d; padding: 11px 14px; line-height: 1.6; font-size: 11px; }
-.stats-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 16px; margin-bottom: 24px; }
+.stats-grid { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 16px; margin-bottom: 24px; }
 .stat-card { position: relative; overflow: hidden; padding: 18px 19px 17px; border: 1px solid var(--border); border-radius: 8px; background: linear-gradient(120deg, #121c23, #10171e); min-height: 133px; }
 .stat-top { display: flex; align-items: center; justify-content: space-between; gap: 12px; color: #9dafbc; font-size: 10px; font-weight: 500; }
 .stat-top .icon { color: var(--dim); width: 15px; height: 15px; }
@@ -131,6 +131,11 @@ h2 { margin: 0; font-size: 12px; font-weight: 550; letter-spacing: -0.1px; }
 .graph-node.unavailable .node-body { fill: #2b2621; stroke: #a68a64; }
 .graph-node.unavailable .node-halo { stroke: #aa956a22; fill: #aa956a04; }
 .graph-node .node-symbol { color: #b1eed4; }
+.graph-node .node-halo.load { fill: #80ddbb14; stroke: #63b19640; }
+.graph-node.unavailable .node-halo.load { fill: #aa956a10; stroke: #d29a5a88; }
+.node-name.small { font-size: 9px; font-weight: 500; stroke-width: 3px; }
+#topology.large .graph-edge.live { stroke-opacity: 0.45; stroke-width: 0.9; }
+#topology.large .graph-edge.uncertain { stroke: #c08a55; stroke-opacity: 0.55; stroke-width: 0.9; }
 .graph-node.unavailable .node-symbol { color: #e1c59d; }
 .node-name { fill: #c6d8e2; font-size: 12px; text-anchor: middle; font-weight: 550; paint-order: stroke; stroke: #0e171d; stroke-width: 4px; stroke-linejoin: round; }
 .node-caption { fill: #7f9baf; font-size: 9px; text-anchor: middle; }
@@ -202,13 +207,11 @@ td .badge { font-size: 8px; }
 .page-footer .icon { width: 12px; height: 12px; }
 .section-heading { display: flex; justify-content: space-between; margin: 26px 0 17px; align-items: center; }
 .section-heading > span { font-size: 10px; color: var(--dim); }
-.broker-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 18px; }
-.broker-card { padding: 21px; }
-.broker-card-title { display: flex; justify-content: space-between; gap: 12px; align-items: center; margin-bottom: 13px; }
-.broker-card-title h2 { font-size: 16px; overflow-wrap: anywhere; }
-.broker-card .detail-endpoint { font-size: 10px; }
-.broker-card .detail-list { margin: 23px 0; }
-.broker-card .button { width: 100%; }
+.sort-button { background: transparent; border: 0; padding: 0; color: inherit; font: inherit; cursor: pointer; }
+.sort-button:hover, th[aria-sort="ascending"] .sort-button, th[aria-sort="descending"] .sort-button { color: var(--mint); }
+.broker-table td, .broker-table th { padding-left: 14px; padding-right: 14px; }
+.detail-note { color: var(--dim); font-size: 10px; line-height: 1.5; margin: 12px 0 0; overflow-wrap: anywhere; }
+.traffic-panel .filters { flex-wrap: nowrap; }
 .session-tools { gap: 18px; flex-wrap: wrap; }
 .search-field { display: flex; align-items: center; gap: 9px; color: var(--dim); flex: 1; min-width: 200px; }
 .search-field .icon { width: 16px; height: 16px; }
@@ -248,14 +251,13 @@ td .badge { font-size: 8px; }
     .topbar { padding: 0 23px; }
     .page-heading { gap: 15px; }
     .refresh-note { display: none; }
-    .stats-grid { gap: 11px; }
+    .stats-grid { gap: 11px; grid-template-columns: repeat(3, minmax(0, 1fr)); }
     .stat-card { padding: 15px; }
     .stat-main strong { font-size: 28px; }
     .stat-foot { font-size: 8px; max-width: 95%; }
     .topology-grid { grid-template-columns: minmax(0, 1fr) 228px; gap: 14px; }
     .activity-grid { grid-template-columns: minmax(0, 1fr) 268px; gap: 14px; }
     .graph-footer > span { display: none; }
-    .broker-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
     .session-details-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }
 
@@ -293,7 +295,6 @@ td .badge { font-size: 8px; }
     .page-heading p { font-size: 10px; max-width: 270px; line-height: 1.6; }
     .topbar-right time, .topbar-right .divider, .workspace-avatar { display: none; }
     .breadcrumb { gap: 9px; font-size: 10px; }
-    .broker-grid { grid-template-columns: 1fr; }
     .session-details-grid { grid-template-columns: 1fr; }
     .page-footer { font-size: 8px; flex-wrap: wrap; }
 }

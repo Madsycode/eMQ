@@ -33,9 +33,11 @@ namespace eMQ
         options.maxProfiles = eCore::ReadYAML(root, "max_profiles", options.maxProfiles);
         options.maxPendingBytes = eCore::ReadYAML(root, "max_pending_bytes", options.maxPendingBytes);
         options.retryInterval = eCore::ReadYAML(root, "retry_interval_ms", options.retryInterval);
+        options.maxRetries = eCore::ReadYAML(root, "max_retries", options.maxRetries);
         options.operationTimeout = eCore::ReadYAML(root, "operation_timeout_ms", options.operationTimeout);
         options.autoReconnect = eCore::ReadYAML(root, "auto_reconnect", options.autoReconnect);
         options.authIdentity = eCore::ReadYAML<std::string>(root, "auth_identity", {});
+        options.allowInsecureAuth = eCore::ReadYAML(root, "allow_insecure_auth", options.allowInsecureAuth);
         options.reconnectInterval = eCore::ReadYAML(root, "reconnect_interval_ms", options.reconnectInterval);
         if (root.contains("failover_endpoints"))
         {
@@ -74,12 +76,17 @@ namespace eMQ
                 throw std::invalid_argument("Authentication and payload keys must be different");
             }
             options.keyEpoch = eCore::ReadYAML<uint32_t>(root, "key_epoch", 1);
+            options.requireEncryption = eCore::ReadYAML(root, "require_encryption", options.requireEncryption);
             auto minimum = eCore::ReadYAML(root, "minimum_key_epoch", options.keyEpoch);
             auto maximum = eCore::ReadYAML(root, "maximum_key_epoch", options.keyEpoch);
             auto topic = eCore::ReadYAML<std::string>(root, "key_subtree", {});
             auto epoch = topic.empty() ? std::optional<uint32_t>{} : std::optional(options.keyEpoch);
             auto directory = eCore::ConfigPath(filename, eCore::ReadYAML<std::string>(root, "payload_state_directory", {}));
-            options.cipher = std::make_shared<PayloadCipher>(KeyGrant{std::move(key), topic, epoch}, minimum, maximum, 128, 4096, directory);
+            auto keys = eCore::ReadYAML<size_t>(root, "payload_key_cache", 128);
+            auto replays = eCore::ReadYAML<size_t>(root, "payload_replay_limit", 4096);
+            auto reservation = eCore::ReadYAML<uint64_t>(root, "payload_nonce_reservation", 1024);
+            options.cipher = std::make_shared<PayloadCipher>(KeyGrant{std::move(key), topic, epoch}, minimum, maximum,
+                keys, replays, directory, reservation);
         }
         return options;
     }

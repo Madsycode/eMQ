@@ -28,6 +28,11 @@ The original `Protocol.h` contains older constants that disagree with the paper.
   can resemble a valid request header, so missing IDs cannot always identify an
   old peer. Deploy matched brokers and clients; no format guessing, capability
   negotiation or mixed-version RPC interoperability is provided.
+- The CONREQ authentication token and the token-bearing CONSYN response are
+  exactly 32 bytes, as Tables 3 and 5 specify (`MMQP_TOKEN_SIZE`). Since
+  2026-10-12 the codec rejects any other length on encode and decode. Earlier
+  builds accepted any non-empty token; the broker already refused non-32-byte
+  tokens during authentication, so only malformed peers are affected.
 - Reason strings appear after a nonzero reason iff IRS is negotiated. This
   includes `0x80`, which the prose's strict inequality accidentally omits.
   The initial code's reason registry is retained; missing codes are explicit
@@ -50,9 +55,24 @@ The original `Protocol.h` contains older constants that disagree with the paper.
 
 ## Delivery and state
 
-- PIDs are 16-bit on the wire but monotonic within a session and direction.
-  Exhaustion is an error requiring a fresh session, never silent wraparound.
-  Profile request IDs are independent of publication sequence numbers.
+- Publication PIDs wrap since 2026-10-12, replacing the paper's "MUST NOT wrap
+  after 65,535" rule at the author's request. Each endpoint keeps a 64-bit
+  sequence n per session and direction and sends `WirePid(n) = ((n - 1) mod
+  65535) + 1`, so PIDs cycle through 1..65535 and zero stays invalid. Receivers
+  compare a PID with their checkpoint S_x using RFC 1982 serial arithmetic:
+  delta = (PID - S_x) mod 65535.
+  - delta 1..256 (multiplexed) or 1..32767 (ordered): a new publication.
+  - delta 257..32767 (multiplexed): outside the window; rejected.
+  - delta 0 or above 32767: an earlier PID, acknowledged only against a matching
+    receipt and otherwise rejected.
+  This is unambiguous because send admission keeps every transmitted PID, new
+  or retried, within 256 positions of the oldest unacknowledged one. That is far
+  below half of the 65,535-value space. Receipts, pending queues and the cluster
+  message identity use the 64-bit sequence, so identities stay unique after a
+  wrap. No wire field, packet type or flag changed, and a session no longer ends
+  at 65,535 publications. A pre-wrap peer still requires a fresh session at that
+  point, and it rejects a wrapped PID instead of misreading it.
+  Profile request IDs and responder correlation IDs remain nonwrapping sequences.
 - An unordered receiver rejects a publication beyond its bounded window rather
   than forgetting missing PIDs. Reliable sends must stay within that window.
   QUIC uses a 256-PID window even when some streams individually preserve order.
@@ -90,9 +110,34 @@ The original `Protocol.h` contains older constants that disagree with the paper.
   when delivery of the timeout notification is backpressured.
   Both requester and responder state follow their SIDs through resumption.
   Persistent sessions and broker snapshots embed these wire packets, so the
-  PRT-only encoding uses ESS4, EBR4 and backplane manifest schema 4. ERQ1's
+  PRT-only encoding uses ESS4 (ESS5 since the PID wrap stores 64-bit
+  publication sequences; ESS4 is still read), EBR4/EBR5 and backplane manifest
+  schema 4. ERQ1's
   separately stored request metadata is unchanged. Prior snapshot/manifest
   schemas are rejected rather than guessed or silently migrated.
+- Clients keep a bounded receipt cache of 256 delivery PIDs, each bound to the
+  digest of its canonical publication, using the broker's digest rule. A repeated
+  PID is acknowledged without redelivery only when the digest matches. Different
+  content under a used PID, or a PID at or below the checkpoint without a cached
+  receipt, is a protocol error (`0x8B`). This mirrors the broker-side receipts
+  required by Section I-E2a.
+- While a session is Active, the client answers only the empty keep-alive CONSYN.
+  A token-bearing CONSYN is valid only during the authentication challenge. The
+  client previously answered any token with its HMAC, which acted as an oracle.
+- A new broker-assigned subscriber alias must lie in `32768..65535`. A TOP
+  delivery under an unknown lower alias is rejected with `0x8A`.
+- The paper places keep-alive initiation at the broker. A client fails the
+  connection with `0x87` after twice the negotiated KAI without receiving or
+  sending, then resumes through the normal reconnect path. Counting sends avoids
+  false timeouts, because the broker pings only silent clients. A client that
+  sends constantly to a dead broker is therefore detected by its transport and
+  its QoS 1 retries, not by this check.
+- Broker transactions span one transport read (group commit). Acknowledgements and
+  deliveries produced by any frame of the read are released only after the single
+  checkpoint that covers all of them, so commit-before-ACK still holds per frame.
+  A checkpoint failure aborts the whole read's effects and fails the connection;
+  clients retry and receipts deduplicate. QoS 0 cluster deliveries are batched the
+  same way and one rejected transient delivery does not drop the others.
 - Wills use the paper's `$bwm/` and `$lwm/` prefixes. A missing will suffix is
   the SID. The paper describes LWM for disconnection generally, so clean and
   unclean disconnections both publish it once.
@@ -134,6 +179,19 @@ The original `Protocol.h` contains older constants that disagree with the paper.
   impossible across all devices. Optional cipher storage durably reserves each
   counter before ciphertext is released. Globally allocated publisher identities
   are still needed for a deterministic uniqueness guarantee across devices.
+- Persistent cipher state uses separate records since 2026-10-12:
+  `payload/policy` (grant identity and epoch interval), `payload/nonce` (prefix
+  and exclusive reserved counter bound) and one `payload/replay/<SHA-256 hex>`
+  record per topic/epoch/prefix tuple. Nonce counters are reserved in durable
+  blocks of `nonceReservation` (default 1024; YAML `payload_nonce_reservation`),
+  so encryption flushes once per block. A restart resumes at the reserved bound,
+  so a crash may skip up to one block of counters but never reuses one, as
+  Section II-E1 permits. Each decryption rewrites only its own tuple record,
+  after tag verification and before plaintext release. The previous single
+  `payload` record is migrated to this layout and then erased. Ascon runs outside
+  the cipher lock; key derivation, nonce reservation and replay updates do not.
+  The key cache is LRU with the 128-entry default. Rotation wipes only the keys
+  and replay records outside the new epoch interval.
 - Topic+epoch AAD does not authenticate PID, publication type or response count;
   encryption alone does not prevent replay on the same topic and epoch.
   Operational replay protection must be specified separately.
@@ -161,6 +219,9 @@ The original `Protocol.h` contains older constants that disagree with the paper.
   threshold applies to payload bytes, while MsQuic's actual datagram limit applies
   to the entire encoded packet. Oversized datagrams and exhausted bulk concurrency
   fall back to the corresponding reliable stream, preserving the publication QoS.
+- The transport selects and validates channels from a header-only peek
+  (`Codec::Peek`: type, QoS, topic and payload length). The consumer still
+  decodes and validates the complete body, so each packet is decoded once.
 - Negotiation chooses bounded supported values. Non-control frames that overtake
   CONACK are held within a bounded pre-negotiation queue. Resume preserves the
   negotiated policy. A changed transport/policy requires a fresh session.
@@ -206,6 +267,11 @@ The original `Protocol.h` contains older constants that disagree with the paper.
   delta senders and replica acknowledgements. The executable instead exchanges
   complete fenced profile snapshots under a single session owner, with explicit
   empty replacements for removed shard assertions. It does not send OR-set deltas.
+- `TenantPolicy::Allows` uses the broker's semantics: an empty shard allowlist
+  is unrestricted, the `$bwm/`/`$lwm/` prefixes are removed before checking, and
+  a filter is allowed only when every shard it can match is allowed.
+- Replica Scan RPCs are paged, and each session inbox has byte and record
+  budgets (Section IV-J). See [CLUSTERING.md](CLUSTERING.md).
 - `EpochFilter` admits the current and previous routing epochs with bounded exact
   sets, refusing capacity overflow. `SessionQuorum` commits a version only after
   unique members acknowledge its digest in the configured epoch. Neither primitive

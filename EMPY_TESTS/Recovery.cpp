@@ -3,6 +3,7 @@
 #include <eMQ/Runtime/Broker.h>
 #include <eMQ/Network/QContext.h>
 #include <eMQ/Cluster/Clock.h>
+#include <eMQ/Cluster/Storage.h>
 #include <openssl/pem.h>
 #include <openssl/x509v3.h>
 #include <fstream>
@@ -243,14 +244,15 @@ namespace
         auto digest = Sha256(writer.Data());
         Buffer manifest(digest.begin(), digest.end());
         { ClusterNode current(options); }
+        // Cluster nodes use journaled stores; plant the old manifest the same way.
         {
-            FileStore store(options.directory);
+            FileStore store(options.directory, options.maxBytes, options.maxRecords, true);
             EMPY_CHECK(store.Get("manifest") != std::optional(manifest));
             store.Put("manifest", manifest);
         }
         Throws([&] { ClusterNode legacy(options); });
         {
-            FileStore store(options.directory);
+            FileStore store(options.directory, options.maxBytes, options.maxRecords, true);
             EMPY_CHECK(store.Get("manifest") == std::optional(manifest));
         }
     }
@@ -298,6 +300,104 @@ namespace
         Throws([&] { restored.Decrypt(second, second.topic); });
     }
 
+    uint64_t NonceCounter(const PublishRequest& publication)
+    {
+        Reader reader(publication.encryption->nonce);
+        reader.U64();
+        return reader.U64();
+    }
+
+    void PayloadReservation()
+    {
+        Fixture fixture;
+        auto sender = (fixture.directory / "reserve-sender").string();
+        auto receiver = (fixture.directory / "reserve-receiver").string();
+        Buffer root(16, 0x65);
+        std::set<std::array<uint8_t, 16>> used;
+        std::vector<PublishRequest> sent;
+        auto encrypt = [&] (PayloadCipher& cipher, std::string topic)
+        {
+            PublishRequest publication;
+            publication.topic = std::move(topic);
+            publication.payload = {'R'};
+            cipher.Encrypt(publication, 1);
+            EMPY_CHECK(used.insert(publication.encryption->nonce).second);
+            sent.push_back(publication);
+            return NonceCounter(publication);
+        };
+        {
+            PayloadCipher cipher(KeyGrant{root}, 1, 1, 4, 16, sender, 4);
+            for (uint64_t i = 0; i < 3; ++i) EMPY_CHECK(encrypt(cipher, "reserve/a") == i);
+        }
+        {
+            // A restart resumes at the reserved bound, skipping but never reusing counters.
+            PayloadCipher cipher(KeyGrant{root}, 1, 1, 4, 16, sender, 4);
+            for (uint64_t i = 4; i < 10; ++i) EMPY_CHECK(encrypt(cipher, i % 2 ? "reserve/a" : "reserve/b") == i);
+        }
+        {
+            PayloadCipher cipher(KeyGrant{root}, 1, 1, 4, 16, sender, 4);
+            EMPY_CHECK(encrypt(cipher, "reserve/a") == 12);
+            Throws([] { PayloadCipher invalid(KeyGrant{Buffer(16, 1)}, 1, 1, 4, 16, {}, 0); });
+        }
+        {
+            PayloadCipher cipher(KeyGrant{root}, 1, 1, 4, 16, receiver);
+            for (const auto& publication : sent) EMPY_CHECK(cipher.Decrypt(publication, publication.topic) == Buffer{'R'});
+        }
+        {
+            FileStore store(receiver, 1 << 20, 64);
+            EMPY_CHECK(!store.Get("payload") && store.Get("payload/policy") && store.Keys("payload/replay/").size() == 2);
+        }
+        {
+            // Each replay tuple record survives restart independently.
+            PayloadCipher cipher(KeyGrant{root}, 1, 1, 4, 16, receiver);
+            for (const auto& publication : sent) Throws([&] { cipher.Decrypt(publication, publication.topic); });
+        }
+
+        // Migrate the legacy single-record layout and then erase it.
+        auto legacy = (fixture.directory / "legacy").string();
+        PayloadCipher producer(KeyGrant{root}, 1, 2);
+        PublishRequest seen, fresh;
+        seen.topic = fresh.topic = "legacy/value";
+        seen.payload = {'S'};
+        fresh.payload = {'F'};
+        producer.Encrypt(seen, 1);
+        producer.Encrypt(fresh, 1);
+        {
+            Writer binding;
+            binding.String("MMQP/PAYLOAD/STATE/1");
+            binding.String("");
+            binding.U8(0);
+            Writer writer;
+            writer.U32(0x45504331);
+            writer.Bytes(Hmac256(root, binding.Data()));
+            writer.U32(1);
+            writer.U32(2);
+            NonceSequence({7, 7, 7, 7, 7, 7, 7, 7}, 41).Save(writer);
+            writer.U32(1);
+            writer.String("legacy/value");
+            writer.U32(1);
+            writer.Bytes(std::span(seen.encryption->nonce).first(8));
+            writer.U64(NonceCounter(seen));
+            writer.U8(1);
+            for (size_t i = 1; i < 32; ++i) writer.U8(0);
+            FileStore store(legacy, 1 << 20, 1);
+            store.Put("payload", writer.Take());
+        }
+        for (uint64_t expected : {41ULL, 41ULL + 1024})
+        {
+            PayloadCipher cipher(KeyGrant{root}, 1, 2, 4, 16, legacy);
+            Throws([&] { cipher.Decrypt(seen, seen.topic); });
+            PublishRequest own;
+            own.topic = "legacy/own";
+            own.payload = {'O'};
+            cipher.Encrypt(own, 2);
+            EMPY_CHECK(own.encryption->nonce[0] == 7 && NonceCounter(own) == expected);
+            if (expected == 41) EMPY_CHECK(cipher.Decrypt(fresh, fresh.topic) == Buffer{'F'});
+        }
+        FileStore store(legacy, 1 << 20, 64);
+        EMPY_CHECK(!store.Get("payload") && store.Get("payload/nonce") && store.Keys("payload/replay/").size() == 1);
+    }
+
     void Standalone()
     {
         Fixture fixture;
@@ -332,6 +432,106 @@ namespace
         Await([&] { return replayed == 8; }, {&subscriber, &late});
         late.Disconnect();
         subscriber.Disconnect();
+    }
+
+    void Journal()
+    {
+        Fixture fixture;
+        auto directory = fixture.directory / "journal";
+        auto log = [&]
+        {
+            for (const auto& entry : std::filesystem::directory_iterator(directory))
+                if (entry.path().extension() == ".log") return entry.path();
+            throw std::runtime_error("Journal file is missing");
+        };
+        {
+            FileStore store(directory);
+            EMPY_CHECK(store.Journal("test").empty());
+            for (uint8_t i = 1; i <= 3; ++i) store.Append("test", Buffer(i, i));
+            EMPY_CHECK(store.JournalBytes("test") > 0);
+        }
+        // A crash during the last flush leaves a torn tail, which is dropped.
+        auto intact = std::filesystem::file_size(log());
+        {
+            std::ofstream file(log(), std::ios::binary | std::ios::app);
+            file.write("\x45\x4A\x4E\x31\x00\x00\x00\x09" "abc", 11);
+        }
+        {
+            FileStore store(directory);
+            auto entries = store.Journal("test");
+            EMPY_CHECK(entries.size() == 3 && entries[2] == Buffer(3, 3));
+            EMPY_CHECK(std::filesystem::file_size(log()) == intact);
+            store.Append("test", Buffer{4});
+            EMPY_CHECK(store.Journal("test").size() == 4);
+        }
+        // Damage before the final entry fails closed.
+        {
+            std::fstream file(log(), std::ios::binary | std::ios::in | std::ios::out);
+            file.seekp(10);
+            file.put('\x7F');
+        }
+        {
+            FileStore store(directory);
+            Throws([&] { store.Journal("test"); });
+            store.Reset("test");
+            EMPY_CHECK(store.Journal("test").empty());
+        }
+
+        // Journaled stores migrate per-record files, replay flushed appends and compact into a snapshot.
+        auto journaled = fixture.directory / "journaled";
+        {
+            FileStore legacy(journaled);
+            legacy.Put("old", Buffer{1});
+            legacy.Put("gone", Buffer{2});
+        }
+        {
+            FileStore store(journaled, 64 << 20, 1024, true);
+            EMPY_CHECK(store.Get("old") == Buffer{1} && store.Get("gone") == Buffer{2});
+            store.Erase("gone");
+            store.Put("new", Buffer(10, 3));
+        }
+        {
+            FileStore store(journaled, 64 << 20, 1024, true);
+            EMPY_CHECK(!store.Get("gone") && store.Get("new") == Buffer(10, 3) && store.Get("old") == Buffer{1});
+            for (int i = 0; i < 40; ++i) store.Put("big" + std::to_string(i % 4), Buffer(256 * 1024, static_cast<uint8_t>(i)));
+            EMPY_CHECK(std::filesystem::exists(journaled / "store.snapshot"));
+        }
+        {
+            FileStore store(journaled, 64 << 20, 1024, true);
+            EMPY_CHECK(store.Get("big3") == Buffer(256 * 1024, 39) && !store.Get("gone") && store.Get("old") == Buffer{1});
+            for (const auto& entry : std::filesystem::directory_iterator(journaled)) EMPY_CHECK(entry.path().extension() != ".rec");
+        }
+
+        // Large retained queues force compaction; restart restores the compacted base.
+        BrokerOptions options;
+        options.port = 0;
+        options.stateDirectory = (fixture.directory / "compacted").string();
+        options.maxRetainedBytes = 8 * 1024 * 1024;
+        options.maxStateBytes = 32 * 1024 * 1024;
+        auto broker = std::make_unique<Broker>(options);
+        auto port = broker->Listen();
+        Client publisher;
+        publisher.Connect("127.0.0.1", port);
+        Okay(publisher.Register("compact/value", 1, 60, 8));
+        for (uint8_t i = 0; i < 12; ++i) Okay(publisher.Publish("compact/value", Buffer(200 * 1024, i), 1));
+        publisher.Disconnect();
+        broker.reset();
+        {
+            FileStore store(options.stateDirectory, options.maxStateBytes);
+            auto base = store.Get("broker");
+            EMPY_CHECK(base && base->size() > 4 && (*base)[3] == '5');
+            EMPY_CHECK(store.Journal("broker").size() < 12);
+        }
+        broker = std::make_unique<Broker>(options);
+        port = broker->Listen();
+        Client late;
+        std::vector<uint8_t> values;
+        late.On<Receive>("compact/#", [&] (const auto& event) { values.push_back(event.message.payload.at(0)); });
+        late.Connect("127.0.0.1", port);
+        Okay(late.Subscribe("compact/#"));
+        Await([&] { return values.size() == 8; }, {&late});
+        for (size_t i = 0; i < values.size(); ++i) EMPY_CHECK(values[i] == i + 4);
+        late.Disconnect();
     }
 
     void Tenants()
@@ -395,6 +595,54 @@ namespace
         Throws([&] { nodes[1]->Commit("session-test", {'c'}); });
         EMPY_CHECK(!nodes[1]->Owns("session-test"));
         EMPY_CHECK(!nodes[1]->Inspect({"session-test"}).ownership.contains("session-test"));
+    }
+
+    void Inboxes()
+    {
+        Fixture fixture;
+        auto options = fixture.Options(false);
+        std::array<std::unique_ptr<ClusterNode>, 3> nodes;
+        for (size_t i = 0; i < nodes.size(); ++i)
+        {
+            options[i].transport.maxPacket = 1024 * 1024;
+            options[i].maxInboxRecords = 14;
+            nodes[i] = std::make_unique<ClusterNode>(options[i]);
+            nodes[i]->Start();
+        }
+        ProfileEntry profile;
+        profile.type = MMQP_PROREQ_TYPE_SUB;
+        profile.topic = "large/value";
+        profile.qos = 1;
+        std::vector<ClusterProfile> targets{{"", "large-inbox", profile, UINT64_MAX, false}};
+        auto expiry = UnixMilliseconds() + 60000;
+        auto publish = [&] (uint64_t sequence)
+        {
+            PublishRequest publication;
+            publication.topic = "large/value";
+            publication.qos = 1;
+            publication.packetId = static_cast<uint16_t>(sequence);
+            publication.payload = Buffer(160 * 1024, static_cast<uint8_t>(sequence));
+            nodes[sequence % nodes.size()]->Publish("large-sender", sequence, publication, targets, expiry);
+        };
+        // The inbox exceeds a single 1 MiB scan reply, so it is read in several pages.
+        for (uint64_t sequence = 1; sequence <= 14; ++sequence) publish(sequence);
+        auto inbox = nodes[1]->Inbox("large-inbox");
+        EMPY_CHECK(inbox.size() == 14);
+        for (size_t i = 0; i < inbox.size(); ++i)
+            EMPY_CHECK(inbox[i].publication.packetId == i + 1 && inbox[i].publication.payload == Buffer(160 * 1024, static_cast<uint8_t>(i + 1)));
+        // The per-session record budget rejects admission instead of accepting it.
+        uint8_t reason = 0;
+        try { publish(15); }
+        catch (const ProtocolError& error) { reason = error.reason; }
+        EMPY_CHECK(reason == MMQP_REASON_BUSY);
+        EMPY_CHECK(nodes[2]->Inbox("large-inbox").size() == 14);
+        // A consumed record releases its budget; the retry keeps the original identity.
+        nodes[0]->Acquire("large-inbox");
+        nodes[0]->Acknowledge(inbox.front());
+        publish(15);
+        auto drained = nodes[0]->Inbox("large-inbox");
+        EMPY_CHECK(drained.size() == 14 && drained.back().publication.packetId == 15);
+        EMPY_CHECK(std::none_of(drained.begin(), drained.end(), [&] (const auto& item) { return item.identity == inbox.front().identity; }));
     }
 
     void Brokers(bool quic)
@@ -544,9 +792,12 @@ void TestRecovery()
     Storage();
     SnapshotSchemas();
     PayloadState();
+    PayloadReservation();
     Standalone();
+    Journal();
     Tenants();
     Quorum(false);
+    Inboxes();
     Brokers(false);
 }
 

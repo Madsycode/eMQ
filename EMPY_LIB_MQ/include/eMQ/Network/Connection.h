@@ -25,9 +25,13 @@ namespace eMQ
         using Pointer = std::shared_ptr<Connection>;
         using Receive = std::function<void(std::span<const uint8_t>)>;
         using Closed = std::function<void(const std::string&)>;
+        using Flushed = std::function<void()>;
 
         Receive onReceive;
         Closed onClose;
+        // Runs after the frames of one transport read were delivered through onReceive,
+        // so a receiver can commit them as one group before releasing their effects.
+        Flushed onFlush;
         virtual ~Connection() = default;
         virtual bool Send(Buffer bytes) = 0;
         virtual void Close(bool drain = false) = 0;

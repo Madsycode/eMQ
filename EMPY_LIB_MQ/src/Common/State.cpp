@@ -50,7 +50,7 @@ namespace eMQ
             bool allowed = type == MMQP_PUBREQ_TYPE_RES
                 ? entry.type == MMQP_PROREQ_TYPE_SUB && entry.request
                 : entry.type == MMQP_PROREQ_TYPE_REG && (type != MMQP_PUBREQ_TYPE_REQ || entry.request);
-            if (!allowed || !TopicMatches(entry.topic, topic)) continue;
+            if (!allowed || !MatchTopic(entry.topic, topic)) continue;
             auto score = entry.topic.find_first_of("+#");
             if (score == std::string::npos) score = entry.topic.size() + 256;
             if (!best || score > specificity || (score == specificity && entry.topic < best->topic))
@@ -65,12 +65,16 @@ namespace eMQ
     std::vector<ProfileEntry> ProfileTable::Subscriptions(std::string_view topic, uint8_t qos, bool responders) const
     {
         std::vector<ProfileEntry> matches;
-        for (const auto& entry : entries)
-        {
-            if (entry.type == MMQP_PROREQ_TYPE_SUB && qos <= entry.qos
-                && (!responders || entry.request) && TopicMatches(entry.topic, topic))
-                matches.emplace_back(entry);
-        }
+        this->ForEachSubscription(topic, qos, responders, [&] (const ProfileEntry& entry) { matches.emplace_back(entry); });
         return matches;
+    }
+
+    bool ProfileTable::Subscribed(std::string_view topic, uint8_t qos, bool responders) const
+    {
+        return std::any_of(entries.begin(), entries.end(), [&] (const ProfileEntry& entry)
+        {
+            return entry.type == MMQP_PROREQ_TYPE_SUB && qos <= entry.qos
+                && (!responders || entry.request) && MatchTopic(entry.topic, topic);
+        });
     }
 }

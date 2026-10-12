@@ -37,21 +37,20 @@ namespace eMQ
         return result;
     }
 
-    QuicChannel QuicPlan::Select(const Message& message, size_t frameSize, uint16_t datagramLimit, size_t activeBulk) const
+    QuicChannel QuicPlan::Select(const PacketSummary& packet, size_t frameSize, uint16_t datagramLimit, size_t activeBulk) const
     {
-        auto publication = std::get_if<PublishRequest>(&message);
-        if (!publication) return QuicChannel::Control;
-        if (!publication->qos && m_Policy.datagram && publication->payload.size() <= *m_Policy.datagram
+        if (!packet.Publication()) return QuicChannel::Control;
+        if (!packet.qos && m_Policy.datagram && packet.payload <= *m_Policy.datagram
             && frameSize <= datagramLimit) return QuicChannel::Datagram;
         if (*m_Policy.strategy == MMQP_QUIC_STRATEGY_SINGLE) return QuicChannel::Control;
-        if (m_Policy.bulk && publication->payload.size() > m_Policy.bulk->threshold
+        if (m_Policy.bulk && packet.payload > m_Policy.bulk->threshold
             && activeBulk < m_Policy.bulk->streams) return QuicChannel::Bulk;
-        return publication->qos ? QuicChannel::Reliable : QuicChannel::BestEffort;
+        return packet.qos ? QuicChannel::Reliable : QuicChannel::BestEffort;
     }
 
-    void QuicPlan::Validate(QuicChannel channel, const Message& message, size_t frameSize) const
+    void QuicPlan::Validate(QuicChannel channel, const PacketSummary& packet, size_t frameSize) const
     {
-        auto publication = std::get_if<PublishRequest>(&message);
+        auto publication = packet.Publication() ? &packet : nullptr;
         bool valid = false;
         switch (channel)
         {
@@ -64,11 +63,11 @@ namespace eMQ
                 && publication->qos == (channel == QuicChannel::Reliable ? 1 : 0);
             break;
         case QuicChannel::Bulk:
-            valid = publication && m_Policy.bulk && publication->payload.size() > m_Policy.bulk->threshold;
+            valid = publication && m_Policy.bulk && publication->payload > m_Policy.bulk->threshold;
             break;
         case QuicChannel::Datagram:
             valid = publication && !publication->qos && m_Policy.datagram
-                && publication->payload.size() <= *m_Policy.datagram && frameSize <= UINT16_MAX;
+                && publication->payload <= *m_Policy.datagram && frameSize <= UINT16_MAX;
             break;
         }
         if (!valid) throw ProtocolError("Packet arrived on an incompatible QUIC channel", MMQP_REASON_POLICY_VIOLATION);

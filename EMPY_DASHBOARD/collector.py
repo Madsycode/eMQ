@@ -1,4 +1,8 @@
-"""Bounded parallel collection, stale detection, counter deltas and short history."""
+"""Bounded parallel collection, stale detection, counter deltas, short history and session queries.
+
+The browser receives compact per-broker summaries; full session lists stay in the
+collector and are served as filtered pages, so 100+ brokers remain responsive.
+"""
 
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -10,6 +14,10 @@ import time
 from urllib import error, request
 
 EMPY_MAX_SNAPSHOT_BYTES = 16 * 1024 * 1024
+EMPY_MAX_WORKERS = 32
+EMPY_PREVIEW_SESSIONS = 6
+EMPY_PAGE_LIMIT = 100
+EMPY_STATE_RANKS = {"online": 0, "unknown": 1, "offline": 2}
 EMPY_COUNTERS = ("receivedPackets", "receivedBytes", "sentPackets", "sentBytes")
 EMPY_METRICS = EMPY_COUNTERS + ("accepted", "publications", "duplicates", "rejected", "forwarded",
                               "retransmitted", "sessions", "online", "retainedBytes", "pending")
@@ -124,6 +132,32 @@ def fetch(source, timeout):
         return None, None, "Telemetry endpoint unreachable"
 
 
+def roles(session):
+    """Same role derivation as the browser model."""
+    result = []
+    if session["requesters"]:
+        result.append("Requester")
+    if session["responders"]:
+        result.append("Responder")
+    if session["registrations"] > session["requesters"]:
+        result.append("Publisher")
+    if session["subscriptions"] > session["responders"]:
+        result.append("Subscriber")
+    return result or ["Connected"]
+
+
+def summarize(data):
+    """Broker snapshot without its session list: counts, requests and a small preview."""
+    summary = {key: value for key, value in data.items() if key != "sessions"}
+    sessions = data["sessions"]
+    summary["observedSessions"] = len(sessions)
+    summary["requests"] = sum(session["requests"] for session in sessions)
+    preview = sorted(sessions, key=lambda session: (not session["online"], session["identifier"]))[:EMPY_PREVIEW_SESSIONS]
+    summary["preview"] = [{"identifier": session["identifier"], "online": session["online"], "roles": roles(session)}
+                          for session in preview]
+    return summary
+
+
 def rates(previous, current, seconds):
     if not previous or seconds <= 0:
         return None
@@ -140,7 +174,7 @@ class Collector:
         self._stop = threading.Event()
         self._thread = None
         self._records = {source.identifier: {"id": source.identifier, "name": source.name, "data": None,
-                         "state": "connecting", "error": None, "lastSuccessAt": None, "progress": None,
+                         "summary": None, "state": "connecting", "error": None, "lastSuccessAt": None, "progress": None,
                          "latencyMs": None, "rates": None} for source in settings.sources}
         self._history = deque(maxlen=settings.history)
         self._events = deque(maxlen=100)
@@ -182,33 +216,84 @@ class Collector:
                     if now - record["progress"] > self.stale_after:
                         state, failure, rate = "stale", "Broker snapshot has stopped advancing", None
                 record["data"] = data
+                record["summary"] = summarize(data)
             if state != previous_state:
                 self._event("online" if state == "online" else "warning", f"{source.name}: {state}", timestamp)
             record.update(state=state, error=failure, latencyMs=latency, rates=rate)
 
+    def _sources(self, now):
+        """Effective per-source state; the caller holds the lock."""
+        sources = []
+        instances = set()
+        for value in self._records.values():
+            item = {key: entry for key, entry in value.items() if key not in ("progress", "summary")}
+            item["ageMs"] = None if value["progress"] is None else round(max(0, now - value["progress"]) * 1000)
+            if item["state"] == "online" and item["ageMs"] > self.stale_after * 1000:
+                item.update(state="stale", error="Broker snapshot has stopped advancing", rates=None)
+            if item["state"] == "online":
+                instance = item["data"]["instance"]
+                if instance in instances:
+                    item.update(state="duplicate", error="Another source already reports this broker instance", rates=None)
+                else:
+                    instances.add(instance)
+            sources.append(item)
+        return sources
+
     def state(self, now=None):
         now = time.monotonic() if now is None else now
         with self._lock:
-            sources = []
-            instances = set()
-            for value in self._records.values():
-                item = {key: entry for key, entry in value.items() if key != "progress"}
-                item["ageMs"] = None if value["progress"] is None else round(max(0, now - value["progress"]) * 1000)
-                if item["state"] == "online" and item["ageMs"] > self.stale_after * 1000:
-                    item.update(state="stale", error="Broker snapshot has stopped advancing", rates=None)
-                if item["state"] == "online":
-                    instance = item["data"]["instance"]
-                    if instance in instances:
-                        item.update(state="duplicate", error="Another source already reports this broker instance", rates=None)
-                    else:
-                        instances.add(instance)
-                sources.append(item)
+            sources = self._sources(now)
+            for item in sources:
+                item["data"] = self._records[item["id"]]["summary"]
             return {"schema": 1, "name": self.settings.name, "startedAt": self.started_at,
                     "generatedAt": round(time.time() * 1000), "intervalMs": round(self.settings.interval * 1000),
                     "sources": sources, "history": list(self._history), "events": list(self._events)}
 
+    def _rows(self, now, broker="all"):
+        for source in self._sources(now):
+            if broker != "all" and broker != source["id"]:
+                continue
+            for session in (source["data"] or {}).get("sessions", ()):
+                state = "unknown" if source["state"] != "online" else "online" if session["online"] else "offline"
+                yield {"source": {"id": source["id"], "name": source["name"], "state": source["state"]},
+                       "session": session, "state": state, "roles": roles(session),
+                       "key": f'{source["id"]}/{session["identifier"]}'}
+
+    def sessions(self, broker="all", state="all", role="all", search="", page=0, size=25, now=None):
+        """One filtered page of sessions across all sources, ordered like the browser table."""
+        now = time.monotonic() if now is None else now
+        size = max(1, min(EMPY_PAGE_LIMIT, size))
+        search = search.casefold()
+        with self._lock:
+            rows, observed = [], 0
+            for row in self._rows(now, broker):
+                observed += 1
+                if state != "all" and row["state"] != state:
+                    continue
+                if role != "all" and role not in row["roles"]:
+                    continue
+                session = row["session"]
+                if search and search not in f'{session["identifier"]} {row["source"]["name"]} {row["source"]["id"]} {session["realm"]}'.casefold():
+                    continue
+                rows.append(row)
+        rows.sort(key=lambda row: (EMPY_STATE_RANKS[row["state"]], row["source"]["name"], row["session"]["identifier"]))
+        pages = max(1, -(-len(rows) // size))
+        page = max(0, min(page, pages - 1))
+        return {"total": len(rows), "observed": observed, "page": page, "pages": pages, "size": size,
+                "rows": rows[page * size:(page + 1) * size]}
+
+    def session(self, key, now=None):
+        now = time.monotonic() if now is None else now
+        broker, _, identifier = key.partition("/")
+        with self._lock:
+            for row in self._rows(now, broker):
+                if row["session"]["identifier"] == identifier:
+                    return row
+        return None
+
     def _run(self):
-        with ThreadPoolExecutor(max_workers=len(self.settings.sources), thread_name_prefix="EmpyTelemetry") as pool:
+        workers = min(EMPY_MAX_WORKERS, len(self.settings.sources))
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="EmpyTelemetry") as pool:
             while not self._stop.is_set():
                 started = time.monotonic()
                 tasks = {pool.submit(fetch, source, self.settings.timeout): source for source in self.settings.sources}
@@ -217,7 +302,8 @@ class Collector:
                 state = self.state()
                 online = [source for source in state["sources"] if source["state"] == "online"]
                 available = [source["rates"] for source in online if source["rates"] is not None]
-                point = {"time": round(time.time() * 1000), "coverage": len(online),
+                links = sum(peer["connected"] for source in online for peer in (source["data"]["cluster"] or {}).get("peers", ()))
+                point = {"time": round(time.time() * 1000), "coverage": len(online), "links": links,
                          "online": sum(source["data"]["metrics"]["online"] for source in online)}
                 point.update({key: sum(item[key] for item in available) if available else None
                               for key in ("receivedBytes", "sentBytes", "publications")})

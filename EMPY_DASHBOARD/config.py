@@ -7,6 +7,8 @@ import os
 from pathlib import Path
 from urllib.parse import urlsplit
 
+EMPY_MAX_SOURCES = 256
+
 
 @dataclass(frozen=True)
 class Source:
@@ -39,8 +41,8 @@ def load(path):
     if not isinstance(root, dict):
         raise ValueError("Dashboard configuration must be a JSON object")
     entries = root.get("brokers")
-    if not isinstance(entries, list) or not 1 <= len(entries) <= 32:
-        raise ValueError("Dashboard configuration needs 1..32 brokers")
+    if not isinstance(entries, list) or not 1 <= len(entries) <= EMPY_MAX_SOURCES:
+        raise ValueError(f"Dashboard configuration needs 1..{EMPY_MAX_SOURCES} brokers")
     sources, identifiers, urls = [], set(), set()
     for entry in entries:
         if not isinstance(entry, dict):

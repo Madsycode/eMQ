@@ -95,6 +95,8 @@ namespace eMQ
             cluster.maxBytes = eCore::ReadYAML(node, "max_state_bytes", cluster.maxBytes);
             cluster.maxRecords = eCore::ReadYAML(node, "max_records", cluster.maxRecords);
             cluster.maxOperations = eCore::ReadYAML(node, "max_operations", cluster.maxOperations);
+            cluster.maxInboxBytes = eCore::ReadYAML(node, "max_inbox_bytes", cluster.maxInboxBytes);
+            cluster.maxInboxRecords = eCore::ReadYAML(node, "max_inbox_records", cluster.maxInboxRecords);
             cluster.transport.quic = eCore::ReadYAML(node, "quic", true);
             cluster.transport.tls = true;
             cluster.transport.mutual = true;

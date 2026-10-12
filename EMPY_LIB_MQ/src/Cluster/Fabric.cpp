@@ -66,6 +66,15 @@ namespace eMQ
         std::sort(m_Options.brokers.begin(), m_Options.brokers.end());
         if (std::adjacent_find(m_Options.brokers.begin(), m_Options.brokers.end()) != m_Options.brokers.end())
             throw std::invalid_argument("Duplicate broker identity");
+        // Epoch and membership are static, so shard placement is computed once.
+        m_Shards.reserve(m_Options.shards);
+        for (uint32_t shard = 0; shard < m_Options.shards; ++shard)
+        {
+            Writer writer(8);
+            writer.U8(1);
+            writer.U32(shard);
+            m_Shards.push_back(this->Select(writer.Data()));
+        }
     }
 
     uint32_t Fabric::Shard(std::string_view topic) const
@@ -104,13 +113,10 @@ namespace eMQ
         return selected;
     }
 
-    std::vector<std::string> Fabric::Replicas(uint32_t shard) const
+    const std::vector<std::string>& Fabric::Replicas(uint32_t shard) const
     {
         if (shard >= m_Options.shards) throw std::out_of_range("Unknown profile shard");
-        Writer writer(8);
-        writer.U8(1);
-        writer.U32(shard);
-        return this->Select(writer.Data());
+        return m_Shards[shard];
     }
 
     std::vector<std::string> Fabric::SessionReplicas(std::string_view identifier) const
@@ -242,18 +248,42 @@ namespace eMQ
         return record;
     }
 
-    void FabricCodec::Validate(const ForwardRecord& record, const Fabric& fabric,
+    DisseminationTree FabricCodec::Validate(const ForwardRecord& record, const Fabric& fabric,
         std::string_view authenticatedPeer, std::string_view receiver, uint64_t now)
     {
-        if (!SecureEqual(record.identity, MessageIdentity(record.session, record.sequence,
-            record.publication.topic, record.acceptedEpoch, record.publication.payload)))
-            throw ProtocolError("Forwarding identity mismatch", MMQP_REASON_AUTH_FAILED);
         if (record.routingEpoch != fabric.Options().epoch || record.acceptedEpoch > record.routingEpoch || record.expires <= now)
             throw ProtocolError("Stale, future or expired forwarding record", MMQP_REASON_UNAUTHORIZED);
         auto tree = fabric.Tree(record.publication.topic, record.ingress, record.destinations);
         if (record.senderRank >= tree.brokers.size() || tree.brokers[record.senderRank] != authenticatedPeer
             || !tree.Edge(authenticatedPeer, receiver))
             throw ProtocolError("Forwarding edge does not match the authenticated tree parent", MMQP_REASON_UNAUTHORIZED);
+        return tree;
+    }
+
+    void FabricCodec::Rebind(std::span<uint8_t> bytes, const ForwardRecord& record, uint32_t senderRank,
+        std::span<const uint8_t> epochKey)
+    {
+        // The rank follows the fixed header, identity, four integers, session and ingress.
+        Writer header(1024);
+        header.String("MHF");
+        header.U8(1);
+        header.U8(1);
+        header.Bytes(record.identity);
+        header.U64(record.acceptedEpoch);
+        header.U64(record.routingEpoch);
+        header.U64(record.sequence);
+        header.U64(record.expires);
+        header.String(record.session);
+        header.String(record.ingress);
+        auto offset = header.Data().size();
+        if (epochKey.size() < 32 || bytes.size() < offset + 4 + 32 || !std::equal(header.Data().begin(), header.Data().end(), bytes.begin()))
+            throw ProtocolError("Forwarding envelope does not match its record");
+        uint32_t stored = 0;
+        for (size_t i = 0; i < 4; ++i) stored = (stored << 8) | bytes[offset + i];
+        if (stored != record.senderRank) throw ProtocolError("Forwarding envelope does not match its record");
+        for (size_t i = 0; i < 4; ++i) bytes[offset + i] = static_cast<uint8_t>(senderRank >> (24 - 8 * i));
+        auto mac = Hmac256(epochKey, bytes.first(bytes.size() - 32));
+        std::copy(mac.begin(), mac.end(), bytes.end() - 32);
     }
 
     EpochFilter::EpochFilter(uint64_t epoch, size_t capacity): m_Current(epoch), m_Capacity(capacity)

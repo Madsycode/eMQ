@@ -11,6 +11,29 @@ installed dependencies), with QUIC enabled. The added wire vectors and schema
 rejection checks are included below. Commands and compatibility details are in
 [PROJECT_CONTEXT.md](PROJECT_CONTEXT.md); logs are in `Targets/PrtRequestId`.
 
+The 2026-10-12 conformance and performance revision passed all 11 suites in
+Debug and Release with QUIC enabled, with no compiler warnings. It added
+these checks:
+- `protocol`: trie and matcher equivalence against the previous matcher over
+  all filters of up to three levels; header peeks for MSG/REQ/RES with
+  encryption and reasons; exact 32-byte tokens; fragmented framing bounds.
+- `adversarial`: client receipt matching, conflicting and stale PIDs, active
+  CONSYN tokens, alias ranges, and keep-alive timeout with resume.
+- `recovery`: journal torn-tail recovery, mid-file damage rejection and
+  compaction followed by restart; cipher nonce reservation, per-tuple replay
+  restart and legacy layout migration; paged inbox scans larger than one packet
+  and per-session inbox budget rejection and release.
+- `cluster`: tenant policy semantics and byte-identical relay
+  rebinding.
+See [PROJECT_CONTEXT.md](PROJECT_CONTEXT.md) for commands.
+
+The 2026-10-12 dashboard and cluster-scale revision adds journaled-store checks to
+`recovery`, session-query, summary and 256-source tests to the Python suite, and
+mesh and broker-table tests to the JavaScript model suite. `EMPY_DASHBOARD/cluster.py`
+measured 3, 10, 30 and 100 real brokers with zero loss and zero duplicates at a
+fixed 40 QoS 1 publications per second; results and commands are in
+[PROJECT_CONTEXT.md](PROJECT_CONTEXT.md). The browser suite passed against 30 brokers.
+
 | CTest suite | Features | Evidence |
 | --- | --- | --- |
 | `protocol` | F03-F05, F10-F11, F13, F15, F19 | Nine packet types and independent PRT-only QoS 0/1 REQ/RES golden frames; distinct request and packet IDs; rejected zero/truncated request IDs, missing request-count/response-reason fields, retired COR and other reserved bits; persisted ID allocation/exhaustion; RLF boundaries, fragmentation, invalid flags/UTF-8, TIE, profiles, PID/windows and QUIC policies |

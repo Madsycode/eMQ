@@ -243,6 +243,12 @@ namespace eMQ
                     ++stream->frames;
                     this->Frame(*stream->channel, frame);
                 });
+                this->Flush();
+            }
+
+            void Flush()
+            {
+                if (!closed && onFlush) onFlush();
             }
 
             void Frame(QuicChannel channel, std::span<const uint8_t> bytes)
@@ -258,13 +264,13 @@ namespace eMQ
                 }
                 if (plan)
                 {
-                    auto message = Codec::Decode(bytes, {reasons, limit, UINT32_MAX});
-                    auto publication = std::get_if<PublishRequest>(&message);
-                    if (options.backplane && publication && publication->topic == "$mhf/control")
+                    // The consumer decodes and validates the body; routing needs only the headers.
+                    auto packet = Codec::Peek(bytes, {reasons, limit, UINT32_MAX});
+                    if (options.backplane && packet.Publication() && packet.topic == "$mhf/control")
                     {
                         if (channel != QuicChannel::Control) throw ProtocolError("Backplane control record on data stream");
                     }
-                    else plan->Validate(channel, message, bytes.size());
+                    else plan->Validate(channel, packet, bytes.size());
                 }
                 if (onReceive) onReceive(bytes);
             }
@@ -275,10 +281,9 @@ namespace eMQ
                 QuicChannel channel = QuicChannel::Control;
                 if (plan)
                 {
-                    auto message = Codec::Decode(bytes, {reasons, limit, UINT32_MAX});
-                    auto publication = std::get_if<PublishRequest>(&message);
-                    if (!(options.backplane && publication && publication->topic == "$mhf/control"))
-                        channel = plan->Select(message, bytes.size(), datagramLimit, bulk);
+                    auto packet = Codec::Peek(bytes, {reasons, limit, UINT32_MAX});
+                    if (!(options.backplane && packet.Publication() && packet.topic == "$mhf/control"))
+                        channel = plan->Select(packet, bytes.size(), datagramLimit, bulk);
                 }
                 std::shared_ptr<Stream> stream;
                 if (channel != QuicChannel::Datagram)
@@ -640,6 +645,7 @@ namespace eMQ
                     {
                         connection->posted.fetch_sub(bytes.size());
                         connection->Frame(QuicChannel::Datagram, bytes);
+                        connection->Flush();
                     });
                     break;
                 }

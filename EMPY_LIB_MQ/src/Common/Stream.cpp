@@ -56,11 +56,14 @@ namespace eMQ
         if (body.size() > UINT32_MAX)
             throw ProtocolError("Remaining length exceeds the protocol range");
         auto width = LengthWidth(static_cast<uint32_t>(body.size()));
-        Writer writer(limit);
-        writer.U8(type | static_cast<uint8_t>((width - 1) << 2) | flags);
-        writer.Number(body.size(), width);
-        writer.Bytes(body);
-        return writer.Take();
+        if (body.size() + 1 + width > limit)
+            throw ProtocolError("Packet exceeds configured size", MMQP_REASON_POLICY_VIOLATION);
+        // One exact allocation: control octet, big-endian remaining length, body.
+        Buffer frame(1 + width + body.size());
+        frame[0] = type | static_cast<uint8_t>((width - 1) << 2) | flags;
+        for (uint8_t i = 0; i < width; ++i) frame[width - i] = static_cast<uint8_t>(body.size() >> (i * 8));
+        std::copy(body.begin(), body.end(), frame.begin() + 1 + width);
+        return frame;
     }
 
     FrameStream::FrameStream(uint32_t limit): m_Limit(limit)
@@ -73,6 +76,19 @@ namespace eMQ
     {
         while (!bytes.empty())
         {
+            if (m_Buffer.empty())
+            {
+                // Fast path: complete frames are delivered from the read buffer without copying.
+                auto header = ReadHeader(bytes, m_Limit);
+                auto size = header ? size_t{header->size} + header->remaining : 0;
+                if (header && bytes.size() >= size)
+                {
+                    auto frame = bytes.first(size);
+                    bytes = bytes.subspan(size);
+                    receive(frame);
+                    continue;
+                }
+            }
             auto count = std::min(bytes.size(), m_Target - m_Buffer.size());
             m_Buffer.insert(m_Buffer.end(), bytes.begin(), bytes.begin() + count);
             bytes = bytes.subspan(count);

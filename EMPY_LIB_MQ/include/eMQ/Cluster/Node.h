@@ -29,6 +29,10 @@ namespace eMQ
         size_t maxBytes = 256 * 1024 * 1024;
         size_t maxRecords = 65536;
         size_t maxOperations = 1024;
+        // Per-session inbox admission budget on each replica (paper section IV-J).
+        // Zero derives max(maxBytes / 16, packet budget) bytes and maxRecords / 16 records.
+        size_t maxInboxBytes = 0;
+        size_t maxInboxRecords = 0;
     };
 
     struct ClusterProfile
@@ -74,6 +78,9 @@ namespace eMQ
             const std::vector<ClusterProfile>& targets, uint64_t expiry);
         std::vector<ClusterDelivery> Inbox(std::string session);
         void Acknowledge(const ClusterDelivery& delivery);
+        // Consumes several inbox records with concurrent quorum rounds; failures are ignored
+        // because an unconsumed record is only redelivered and deduplicated by its receipt.
+        void Acknowledge(const std::vector<ClusterDelivery>& deliveries);
         void Retain(const PublishRequest& publication, const ProfileEntry& profile, const Digest& identity);
         std::vector<ClusterDelivery> Retained(const std::vector<ProfileEntry>& profiles);
         const Fabric& Placement() const;

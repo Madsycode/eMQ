@@ -80,29 +80,39 @@ namespace eMQ
         return pattern;
     }
 
+    std::pair<std::string_view, std::string_view> SplitShared(std::string_view filter) noexcept
+    {
+        constexpr std::string_view prefix = MMQP_SHARED_TOPIC_PREFIX;
+        if (!filter.starts_with(prefix)) return {{}, filter};
+        auto end = filter.find(MMQP_TOPIC_DELIMETER, prefix.size());
+        if (end == std::string_view::npos) return {{}, {}};
+        return {filter.substr(prefix.size(), end - prefix.size()), filter.substr(end + 1)};
+    }
+
+    bool MatchTopic(std::string_view filter, std::string_view topic) noexcept
+    {
+        filter = SplitShared(filter).second;
+        if (filter.empty() || topic.empty()) return false;
+        // Root wildcards never match reserved '$' status topics.
+        if (topic.front() == '$' && filter.front() != '$') return false;
+        while (true)
+        {
+            auto filterEnd = filter.find(MMQP_TOPIC_DELIMETER);
+            auto level = filter.substr(0, filterEnd);
+            if (level == "#") return true;
+            auto topicEnd = topic.find(MMQP_TOPIC_DELIMETER);
+            if (level != "+" && level != topic.substr(0, topicEnd)) return false;
+            if (filterEnd == std::string_view::npos) return topicEnd == std::string_view::npos;
+            filter.remove_prefix(filterEnd + 1);
+            if (topicEnd == std::string_view::npos) return filter == "#";
+            topic.remove_prefix(topicEnd + 1);
+        }
+    }
+
     bool TopicMatches(std::string_view filter, std::string_view topic)
     {
         auto pattern = ParseTopic(filter, true).filter;
-        auto name = ParseTopic(topic).filter;
-        if (name.front() == '$' && pattern.front() != '$') return false;
-        size_t left = 0;
-        size_t right = 0;
-        while (left < pattern.size())
-        {
-            auto stop = pattern.find('/', left);
-            if (stop == std::string::npos) stop = pattern.size();
-            auto level = std::string_view(pattern).substr(left, stop - left);
-            if (level == "#") return true;
-            if (right >= name.size()) return false;
-            auto next = name.find('/', right);
-            if (next == std::string::npos) next = name.size();
-            if (level != "+" && level != std::string_view(name).substr(right, next - right)) return false;
-            left = stop + 1;
-            right = next + 1;
-            if (next == name.size())
-                return stop == pattern.size() || std::string_view(pattern).substr(left) == "#";
-        }
-        return right > name.size();
+        return MatchTopic(pattern, ParseTopic(topic).filter);
     }
 
     uint32_t DecodeInterval(uint8_t value)

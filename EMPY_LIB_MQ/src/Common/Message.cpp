@@ -24,6 +24,11 @@ namespace eMQ
             Require(value <= 1, "Only QoS 0 and 1 are supported");
         }
 
+        void Token(const Buffer& token)
+        {
+            Require(token.size() == MMQP_TOKEN_SIZE, "Authentication tokens contain exactly 32 bytes", MMQP_REASON_AUTH_FAILED);
+        }
+
         std::string Text(Reader& reader)
         {
             auto text = reader.String();
@@ -148,6 +153,7 @@ namespace eMQ
             {
                 const auto& auth = *properties.auth;
                 Require(!ack || auth.token.empty(), "CONACK cannot contain an authentication token");
+                if (!auth.token.empty()) Token(auth.token);
                 Require(ValidUtf8(auth.identifier), "Invalid session identifier");
                 writer.U8((auth.identifier.empty() ? 0 : MMQP_AUTHEN_FLAGS_SID)
                     | (auth.token.empty() ? 0 : MMQP_AUTHEN_FLAGS_TOK));
@@ -221,7 +227,7 @@ namespace eMQ
                 if (attrs & MMQP_AUTHEN_FLAGS_TOK)
                 {
                     auth.token = reader.Blob();
-                    Require(!auth.token.empty(), "Empty authentication token");
+                    Token(auth.token);
                 }
                 properties.auth = std::move(auth);
             }
@@ -283,7 +289,8 @@ namespace eMQ
             return properties;
         }
 
-        void WritePublication(Writer& writer, const PublishRequest& request, CodecOptions options)
+        void WritePublication(Writer& writer, const PublishRequest& request, CodecOptions options,
+            std::span<const uint8_t> payload)
         {
             Require(request.alias != 0, "Publication alias must be nonzero", MMQP_REASON_INVALID_ALIAS);
             Qos(request.qos);
@@ -307,7 +314,7 @@ namespace eMQ
                 writer.Bytes(request.encryption->nonce);
                 writer.Bytes(request.encryption->tag);
             }
-            writer.Bytes(request.payload);
+            writer.Bytes(payload);
         }
 
         PublishRequest ReadPublication(Reader& reader, uint8_t type, CodecOptions options)
@@ -379,7 +386,7 @@ namespace eMQ
             {
                 if (value.token)
                 {
-                    Require(!value.token->empty(), "Empty authentication token");
+                    Token(*value.token);
                     flags = MMQP_CONSYN_FLAGS_TOK;
                     writer.Blob(*value.token);
                 }
@@ -396,7 +403,8 @@ namespace eMQ
             else if constexpr (std::is_same_v<Type, PublishRequest>)
             {
                 flags = value.type;
-                WritePublication(writer, value, options);
+                writer.Reserve(value.payload.size() + 64 + value.topic.size());
+                WritePublication(writer, value, options, value.payload);
             }
             else
             {
@@ -406,6 +414,43 @@ namespace eMQ
             }
         }, message);
         return Frame(Codec::Type(message), flags, writer.Data(), options.maxPacket);
+    }
+
+    PacketSummary Codec::Peek(std::span<const uint8_t> bytes, CodecOptions options)
+    {
+        auto header = ReadHeader(bytes, options.maxPacket);
+        Require(header && bytes.size() == uint64_t{header->size} + header->remaining,
+            "Incomplete packet or trailing frame bytes");
+        PacketSummary summary;
+        summary.type = header->type;
+        if (!summary.Publication()) return summary;
+        Reader reader(bytes.subspan(header->size));
+        reader.U16();
+        auto flags = reader.U8();
+        Flags(flags, 0xE3);
+        summary.qos = flags & MMQP_QOS_LEVEL_MASK;
+        Qos(summary.qos);
+        if (flags & MMQP_PUBREQ_FLAGS_TOP)
+        {
+            auto topic = reader.Bytes(reader.U8());
+            summary.topic = {reinterpret_cast<const char*>(topic.data()), topic.size()};
+        }
+        if (summary.qos) reader.U16();
+        if (header->flags != MMQP_PUBREQ_TYPE_MSG) reader.U16();
+        if (header->flags == MMQP_PUBREQ_TYPE_REQ) reader.U8();
+        if (header->flags == MMQP_PUBREQ_TYPE_RES && reader.U8() && options.reasons) reader.Bytes(reader.U8());
+        if (flags & MMQP_PUBREQ_FLAGS_E2E) reader.Bytes(4 + 16 + 16);
+        summary.payload = reader.Remaining();
+        return summary;
+    }
+
+    Buffer Codec::Encode(const PublishRequest& header, CodecOptions options, std::span<const uint8_t> payload)
+    {
+        Require(header.payload.empty(), "External payload encoding requires an empty header payload");
+        Writer writer(options.maxPacket);
+        writer.Reserve(payload.size() + 64 + header.topic.size());
+        WritePublication(writer, header, options, payload);
+        return Frame(MMQP_PACKET_PUBREQ, header.type, writer.Data(), options.maxPacket);
     }
 
     Message Codec::Decode(std::span<const uint8_t> bytes, CodecOptions options)
@@ -444,7 +489,7 @@ namespace eMQ
             if (header->flags & MMQP_CONSYN_FLAGS_TOK)
             {
                 sync.token = reader.Blob();
-                Require(!sync.token->empty(), "Empty authentication token");
+                Token(*sync.token);
             }
             message = std::move(sync);
             break;

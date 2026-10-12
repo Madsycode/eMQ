@@ -51,7 +51,9 @@ try
         await page.locator("#show-clients").uncheck();
         assert.equal(await page.locator(".client-dot").count(), 0);
         await page.locator("#show-clients").check();
-        assert(await page.locator(".client-dot").count() > 0);
+        // Fabrics above 12 brokers use the compact ring without client leaves.
+        if (state.sources.length > 12) assert(await page.locator("#topology.large").count() === 1);
+        else assert(await page.locator(".client-dot").count() > 0);
     });
     await Check("Pause and resume retain a readable snapshot", async () =>
     {
@@ -89,10 +91,12 @@ try
     {
         await page.locator('[data-view="brokers"]').click();
         await page.waitForFunction(() => document.getElementById("page-title").textContent === "Broker inventory");
-        await page.locator(".broker-card").first().waitFor({ state: "visible" });
-        assert.equal(await page.locator(".broker-card").count(), state.sources.length);
+        await page.locator("#broker-table tbody tr").first().waitFor({ state: "visible" });
+        assert.equal(await page.locator("#broker-table tbody tr").count(), state.sources.length);
+        await page.getByRole("button", { name: "Msg/s" }).click();
+        assert.equal(await page.locator('#broker-table th[aria-sort="descending"]').count(), 1);
         await page.screenshot({ path: path.join(output, "brokers-desktop.png"), fullPage: true });
-        await page.locator(".broker-card").first().getByRole("button").click();
+        await page.locator("#broker-table .session-link").first().click();
         await page.waitForFunction(() => document.getElementById("page-title").textContent === "Network overview");
         assert.equal(await page.locator("#page-title").innerText(), "Network overview");
     });
@@ -100,21 +104,22 @@ try
     {
         await page.locator('[data-view="sessions"]').click();
         await page.waitForFunction(() => document.getElementById("page-title").textContent === "Client sessions");
-        const source = live.find(item => item.data.sessions.length > 0);
-        assert(source, "The browser checks need at least one real connected client");
-        const session = source.data.sessions[0];
-        await page.locator("#session-broker").selectOption(source.id);
+        const first = (await (await page.request.get(url + "/api/sessions?state=online&size=1")).json()).rows[0];
+        assert(first, "The browser checks need at least one real connected client");
+        const session = first.session;
+        await page.locator("#session-broker").selectOption(first.source.id);
         await page.locator("#session-search").fill(session.identifier);
-        assert.equal(await page.locator("#session-table tbody tr").count(), 1);
+        await page.waitForFunction(() => document.querySelectorAll("#session-table tbody tr").length === 1);
         await page.locator("#session-table .session-link").click();
         assert.equal(await page.locator("#session-detail-id").innerText(), session.identifier);
         assert(await page.locator("#session-inspector").isVisible());
         await page.screenshot({ path: path.join(output, "session-details.png"), fullPage: true });
         await page.locator("#session-search").fill("no-such-session");
-        assert((await page.locator("#session-table").innerText()).includes("No sessions"));
+        await page.waitForFunction(() => document.getElementById("session-table").innerText.includes("No sessions"));
         await page.locator("#session-search").fill("");
         await page.locator("#session-broker").selectOption("all");
         await page.locator("#session-role").selectOption("Publisher");
+        await page.waitForTimeout(500);
         for (const role of await page.locator("#session-table .role-list").allTextContents()) assert(role.includes("Publisher"));
         await page.locator("#session-role").selectOption("all");
     });

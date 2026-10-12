@@ -9,8 +9,8 @@ namespace eMQ
     {
         explicit QuicPlan(QuicPolicy policy = {MMQP_QUIC_STRATEGY_SINGLE, {}, {}});
         static QuicPolicy Negotiate(const QuicPolicy& requested, const QuicPolicy& limits);
-        QuicChannel Select(const Message& message, size_t frameSize, uint16_t datagramLimit, size_t activeBulk) const;
-        void Validate(QuicChannel channel, const Message& message, size_t frameSize) const;
+        QuicChannel Select(const PacketSummary& packet, size_t frameSize, uint16_t datagramLimit, size_t activeBulk) const;
+        void Validate(QuicChannel channel, const PacketSummary& packet, size_t frameSize) const;
         const QuicPolicy& Policy() const;
 
     private:

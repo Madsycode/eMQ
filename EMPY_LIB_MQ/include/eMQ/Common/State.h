@@ -11,21 +11,53 @@ namespace eMQ
 
     enum class Reception : uint8_t { New, Duplicate, OutsideWindow };
 
+    // Publication PIDs cycle through 1..65535 using serial-number arithmetic
+    // (RFC 1982). Both endpoints keep a 64-bit sequence n and transmit
+    // WirePid(n), so WirePid(n) == n (mod 65535). At most MMQP_PID_WINDOW
+    // publications are outstanding, far below half the space, so a receiver
+    // always distinguishes a new PID from a retry and no session renewal is needed.
+    inline constexpr uint32_t MMQP_PID_SPACE = 65535;
+    inline constexpr uint32_t MMQP_PID_HORIZON = MMQP_PID_SPACE / 2;
+    inline constexpr uint32_t MMQP_PID_WINDOW = 256;
+
+    EMPY_INLINE uint16_t WirePid(uint64_t sequence)
+    {
+        return sequence ? static_cast<uint16_t>((sequence - 1) % MMQP_PID_SPACE + 1) : 0;
+    }
+
+    // Forward distance from sequence position n to the wire PID, modulo 65535.
+    EMPY_INLINE uint32_t PidAhead(uint64_t sequence, uint16_t packetId)
+    {
+        return static_cast<uint32_t>((packetId + MMQP_PID_SPACE - sequence % MMQP_PID_SPACE) % MMQP_PID_SPACE);
+    }
+
     struct ReceiveWindow
     {
-        explicit ReceiveWindow(bool ordered = true, uint16_t size = 256):
+        explicit ReceiveWindow(bool ordered = true, uint16_t size = MMQP_PID_WINDOW):
             m_Ordered(ordered), m_Size(size)
         {
             if (!size || size > m_Bits.size()) throw std::invalid_argument("Receive window must be in 1..256");
         }
 
+        // Positions at or up to half the space behind the checkpoint are earlier
+        // PIDs: the caller acknowledges them only against a matching receipt.
         Reception Inspect(uint16_t packetId) const
         {
             if (!packetId) throw ProtocolError("Zero publication PID", MMQP_REASON_INVALID_PID);
-            if (packetId <= m_Checkpoint) return Reception::Duplicate;
-            auto offset = static_cast<size_t>(packetId - m_Checkpoint - 1);
-            if (!m_Ordered && offset >= m_Size) return Reception::OutsideWindow;
-            return !m_Ordered && m_Bits[offset] ? Reception::Duplicate : Reception::New;
+            auto ahead = PidAhead(m_Checkpoint, packetId);
+            if (!ahead || ahead > MMQP_PID_HORIZON) return Reception::Duplicate;
+            if (!m_Ordered && ahead > m_Size) return Reception::OutsideWindow;
+            return !m_Ordered && m_Bits[ahead - 1] ? Reception::Duplicate : Reception::New;
+        }
+
+        // The 64-bit sequence of a wire PID relative to the current checkpoint.
+        uint64_t Sequence(uint16_t packetId) const
+        {
+            auto ahead = PidAhead(m_Checkpoint, packetId);
+            if (ahead && ahead <= MMQP_PID_HORIZON) return m_Checkpoint + ahead;
+            auto behind = (MMQP_PID_SPACE - ahead) % MMQP_PID_SPACE;
+            if (behind > m_Checkpoint) throw ProtocolError("PID precedes the session", MMQP_REASON_INVALID_PID);
+            return m_Checkpoint - behind;
         }
 
         void Commit(uint16_t packetId)
@@ -34,10 +66,11 @@ namespace eMQ
             if (state == Reception::Duplicate) return;
             if (state == Reception::OutsideWindow)
                 throw ProtocolError("Publication is beyond the receive window", MMQP_REASON_INVALID_PID);
-            if (m_Ordered) m_Checkpoint = packetId;
+            auto ahead = PidAhead(m_Checkpoint, packetId);
+            if (m_Ordered) m_Checkpoint += ahead;
             else
             {
-                m_Bits.set(packetId - m_Checkpoint - 1);
+                m_Bits.set(ahead - 1);
                 while (m_Bits[0])
                 {
                     ++m_Checkpoint;
@@ -46,13 +79,14 @@ namespace eMQ
             }
         }
 
-        EMPY_INLINE uint16_t Checkpoint() const { return m_Checkpoint; }
+        // The 64-bit sequence of the highest contiguous accepted publication.
+        EMPY_INLINE uint64_t Checkpoint() const { return m_Checkpoint; }
 
         void Save(Writer& writer) const
         {
             writer.U8(m_Ordered);
             writer.U16(m_Size);
-            writer.U16(m_Checkpoint);
+            writer.U64(m_Checkpoint);
             for (size_t i = 0; i < 256; i += 8)
             {
                 uint8_t byte = 0;
@@ -61,12 +95,13 @@ namespace eMQ
             }
         }
 
-        static ReceiveWindow Load(Reader& reader)
+        // Legacy (ESS4) windows stored a 16-bit checkpoint, which never wrapped.
+        static ReceiveWindow Load(Reader& reader, bool legacy = false)
         {
             auto ordered = reader.U8();
             if (ordered > 1) throw ProtocolError("Invalid stored receive window");
             ReceiveWindow result(ordered != 0, reader.U16());
-            result.m_Checkpoint = reader.U16();
+            result.m_Checkpoint = legacy ? reader.U16() : reader.U64();
             for (size_t i = 0; i < 256; i += 8)
             {
                 auto byte = reader.U8();
@@ -79,10 +114,11 @@ namespace eMQ
     private:
         bool m_Ordered;
         uint16_t m_Size;
-        uint16_t m_Checkpoint = 0;
+        uint64_t m_Checkpoint = 0;
         std::bitset<256> m_Bits;
     };
 
+    // Nonwrapping 16-bit identifiers (profile requests, responder correlation IDs).
     struct PacketSequence
     {
         explicit PacketSequence(uint16_t initial = 0): m_Value(initial) {}
@@ -96,7 +132,7 @@ namespace eMQ
         uint16_t Peek() const
         {
             if (m_Value == UINT16_MAX)
-                throw ProtocolError("PID exhausted; establish a fresh session", MMQP_REASON_INVALID_PID);
+                throw ProtocolError("Identifier space exhausted; establish a fresh session", MMQP_REASON_INVALID_PID);
             return static_cast<uint16_t>(m_Value + 1);
         }
 
@@ -104,6 +140,33 @@ namespace eMQ
 
     private:
         uint16_t m_Value = 0;
+    };
+
+    // Outgoing publication PIDs: a 64-bit sequence whose wire form wraps after 65535.
+    struct PublicationSequence
+    {
+        explicit PublicationSequence(uint64_t issued = 0): m_Issued(issued) {}
+
+        EMPY_INLINE uint16_t Peek() const { return WirePid(m_Issued + 1); }
+        EMPY_INLINE uint16_t Next() { return WirePid(++m_Issued); }
+        EMPY_INLINE uint64_t Issued() const { return m_Issued; }
+
+        // True when the PID names one of the last half-space publications sent.
+        bool Sent(uint16_t packetId) const
+        {
+            if (!packetId || !m_Issued) return false;
+            auto behind = PidAhead(packetId, WirePid(m_Issued));
+            return behind < MMQP_PID_HORIZON && behind < m_Issued;
+        }
+
+        uint64_t Sequence(uint16_t packetId) const
+        {
+            if (!this->Sent(packetId)) throw ProtocolError("PID was not sent in this session", MMQP_REASON_INVALID_PID);
+            return m_Issued - PidAhead(packetId, WirePid(m_Issued));
+        }
+
+    private:
+        uint64_t m_Issued = 0;
     };
 
     struct CorrelationIds
@@ -266,6 +329,17 @@ namespace eMQ
         void Apply(const ProfileRequest& request, size_t limit = 256);
         std::optional<ProfileEntry> Registration(std::string_view topic, uint8_t type) const;
         std::vector<ProfileEntry> Subscriptions(std::string_view topic, uint8_t qos, bool responders = false) const;
+        bool Subscribed(std::string_view topic, uint8_t qos, bool responders = false) const;
+
+        // Allocation-free visit of the subscriptions accepting a canonical topic.
+        template<typename _Visit>
+        void ForEachSubscription(std::string_view topic, uint8_t qos, bool responders, _Visit&& visit) const
+        {
+            for (const auto& entry : entries)
+                if (entry.type == MMQP_PROREQ_TYPE_SUB && qos <= entry.qos
+                    && (!responders || entry.request) && MatchTopic(entry.topic, topic))
+                    visit(entry);
+        }
     };
 
     struct PendingPublication
@@ -279,39 +353,44 @@ namespace eMQ
 
     struct PendingQueue
     {
-        std::map<uint16_t, PendingPublication> entries;
-        size_t maxCount = 256;
+        // Ordered by the 64-bit publication sequence, so retries keep their send
+        // order when wire PIDs wrap. Wire PIDs remain unique among these entries.
+        std::map<uint64_t, PendingPublication> entries;
+        size_t maxCount = MMQP_PID_WINDOW;
         size_t maxBytes = 4 * 1024 * 1024;
 
-        bool CanAdd(size_t bytes, uint16_t packetId = 0) const
+        bool CanAdd(size_t bytes, uint64_t sequence = 0) const
         {
             return entries.size() < maxCount && m_Bytes <= maxBytes && bytes <= maxBytes - m_Bytes
-                && (!packetId || entries.empty() || static_cast<uint32_t>(packetId) < static_cast<uint32_t>(entries.begin()->first) + 256);
+                && (!sequence || entries.empty() || sequence < entries.begin()->first + MMQP_PID_WINDOW);
         }
 
-        void Add(PublishRequest message, size_t bytes, TimePoint retry, TimePoint expiry)
+        void Add(PublishRequest message, uint64_t sequence, size_t bytes, TimePoint retry, TimePoint expiry)
         {
-            if (!message.qos || !message.packetId || entries.contains(message.packetId))
+            if (!message.qos || !message.packetId || message.packetId != WirePid(sequence) || entries.contains(sequence))
                 throw ProtocolError("Invalid pending publication", MMQP_REASON_INVALID_PID);
-            if (!this->CanAdd(bytes, message.packetId))
+            if (!this->CanAdd(bytes, sequence))
                 throw ProtocolError("Reliable send budget exhausted", MMQP_REASON_BUSY);
-            auto packetId = message.packetId;
-            entries.emplace(packetId, PendingPublication{std::move(message), retry, expiry, 0, bytes});
+            m_Index.emplace(message.packetId, sequence);
+            entries.emplace(sequence, PendingPublication{std::move(message), retry, expiry, 0, bytes});
             m_Bytes += bytes;
         }
 
         bool Remove(uint16_t packetId)
         {
-            auto found = entries.find(packetId);
-            if (found == entries.end()) return false;
+            auto index = m_Index.find(packetId);
+            if (index == m_Index.end()) return false;
+            auto found = entries.find(index->second);
             m_Bytes -= found->second.bytes;
             entries.erase(found);
+            m_Index.erase(index);
             return true;
         }
 
         EMPY_INLINE size_t Bytes() const { return m_Bytes; }
 
     private:
+        std::map<uint16_t, uint64_t> m_Index;
         size_t m_Bytes = 0;
     };
 }

@@ -1,4 +1,4 @@
-#include "Checks.h"
+﻿#include "Checks.h"
 #include <eClient/API.h>
 #include <eMQ/Runtime/Broker.h>
 #include <eMQ/Network/QContext.h>
@@ -81,8 +81,63 @@ namespace
     };
 }
 
+namespace
+{
+    // More than 65535 QoS 1 publications in one session: the publisher's PIDs and
+    // the broker's subscriber PIDs both wrap without renegotiating the session.
+    void PidWrap()
+    {
+        BrokerOptions options;
+        options.port = 0;
+        Broker broker(options);
+        auto port = broker.Listen();
+        Client publisher, subscriber;
+        auto sid = publisher.Connect("127.0.0.1", port);
+        subscriber.Connect("127.0.0.1", port);
+        uint32_t next = 0;
+        bool ordered = true;
+        subscriber.On<Receive>("wrap/#", [&] (const Receive& event)
+        {
+            Reader reader(event.message.payload);
+            ordered = ordered && reader.U32() == next;
+            ++next;
+        });
+        Accepted(subscriber.Subscribe("wrap/#", 1));
+        Accepted(publisher.Register("wrap/value"));
+        constexpr uint32_t total = 65535 + 700;
+        constexpr uint32_t batch = 240;
+        for (uint32_t first = 0; first < total; first += batch)
+        {
+            std::vector<std::future<Reason>> results;
+            for (uint32_t i = first; i < std::min(total, first + batch); ++i)
+            {
+                Writer payload;
+                payload.U32(i);
+                results.push_back(publisher.Publish("wrap/value", payload.Take(), 1));
+            }
+            for (auto& result : results) Accepted(std::move(result));
+            Until([&] { return next >= std::min(total, first + batch) && broker.Metrics().pending == 0; }, {&subscriber}, 10000);
+        }
+        EMPY_CHECK(ordered && next == total);
+        auto metrics = broker.Metrics();
+        EMPY_CHECK(metrics.duplicates == 0 && metrics.publications >= total);
+        // The same session continues after the wrap.
+        EMPY_CHECK(publisher.Connected());
+        publisher.Disconnect();
+        EMPY_CHECK(publisher.Connect("127.0.0.1", port, true) == sid);
+        Writer payload;
+        payload.U32(total);
+        Accepted(publisher.Publish("wrap/value", payload.Take(), 1));
+        Until([&] { return next == total + 1; }, {&subscriber});
+        EMPY_CHECK(ordered);
+        publisher.Disconnect();
+        subscriber.Disconnect();
+    }
+}
+
 void TestIntegration()
 {
+    PidWrap();
     BrokerOptions settings;
     settings.port = 0;
     settings.requestTimeout = 800;

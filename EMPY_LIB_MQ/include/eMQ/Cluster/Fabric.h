@@ -31,7 +31,7 @@ namespace eMQ
         explicit Fabric(FabricOptions options);
         uint32_t Shard(std::string_view topic) const;
         std::vector<uint32_t> ProfileShards(std::string_view filter) const;
-        std::vector<std::string> Replicas(uint32_t shard) const;
+        const std::vector<std::string>& Replicas(uint32_t shard) const;
         std::vector<std::string> SessionReplicas(std::string_view identifier) const;
         DisseminationTree Tree(std::string_view topic, std::string_view ingress,
             const std::vector<std::string>& destinations) const;
@@ -40,6 +40,7 @@ namespace eMQ
     private:
         std::vector<std::string> Select(std::span<const uint8_t> key) const;
         FabricOptions m_Options;
+        std::vector<std::vector<std::string>> m_Shards;
     };
 
     EMPY_MQ_API Digest MessageIdentity(std::string_view session, uint64_t sequence,
@@ -66,8 +67,12 @@ namespace eMQ
             size_t limit = 2 * 1024 * 1024);
         static ForwardRecord Decode(std::span<const uint8_t> bytes, std::span<const uint8_t> epochKey,
             size_t limit = 2 * 1024 * 1024, size_t maxDestinations = 4096);
-        static void Validate(const ForwardRecord& record, const Fabric& fabric,
+        // Expects a record produced by Decode, which already bound its identity to the payload.
+        static DisseminationTree Validate(const ForwardRecord& record, const Fabric& fabric,
             std::string_view authenticatedPeer, std::string_view receiver, uint64_t now);
+        // Rewrites the sender rank of an encoded record in place and re-authenticates it.
+        static void Rebind(std::span<uint8_t> bytes, const ForwardRecord& record, uint32_t senderRank,
+            std::span<const uint8_t> epochKey);
     };
 
     struct EMPY_MQ_API EpochFilter
@@ -88,11 +93,19 @@ namespace eMQ
         std::string root;
         std::set<uint32_t> shards;
 
+        // Mirrors broker admission: an empty allowlist is unrestricted, and a
+        // wildcard must be allowed in every shard that it can match.
         bool Allows(const Fabric& fabric, std::string_view topic) const
         {
-            auto canonical = ParseTopic(topic).filter;
-            auto name = ParseTopic(root).filter;
-            return (canonical == name || canonical.starts_with(name + '/')) && shards.contains(fabric.Shard(canonical));
+            auto pattern = ParseTopic(topic, true).filter;
+            for (std::string_view prefix : {MMQP_BIRTH_STATUS_TOPIC_PREFIX, MMQP_LAST_STATUS_TOPIC_PREFIX})
+                if (pattern.starts_with(prefix)) { pattern.erase(0, prefix.size()); break; }
+            auto name = root.empty() ? std::string() : ParseTopic(root).filter;
+            if (!name.empty() && pattern != name && !pattern.starts_with(name + '/')) return false;
+            if (shards.empty()) return true;
+            for (auto shard : fabric.ProfileShards(pattern))
+                if (!shards.contains(shard)) return false;
+            return true;
         }
     };
 

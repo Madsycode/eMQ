@@ -22,6 +22,12 @@ namespace
             socket.non_blocking(true);
         }
 
+        explicit RawPeer(asio::ip::tcp::acceptor& acceptor)
+        {
+            acceptor.accept(socket);
+            socket.non_blocking(true);
+        }
+
         void Bytes(const Buffer& bytes) { asio::write(socket, asio::buffer(bytes)); }
         void Send(const Message& message) { this->Bytes(Codec::Encode(message)); }
         void Close() { socket.close(); }
@@ -297,5 +303,104 @@ void TestAdversarial()
         auto sid = device.Connect("127.0.0.1", isolatedPort);
         Until([&] { return !birth.empty(); }, &monitor);
         EMPY_CHECK(birth == "$bwm/tenant/" + sid);
+    }
+    {
+        // A scripted broker exercises client-side checks the real broker never violates.
+        asio::io_context context;
+        asio::ip::tcp::acceptor acceptor(context, {asio::ip::make_address("127.0.0.1"), 0});
+        auto fakePort = acceptor.local_endpoint().port();
+        auto serve = [&] (Client& client, uint32_t keepalive = 30)
+        {
+            auto connected = client.AsyncConnect("127.0.0.1", fakePort);
+            auto peer = std::make_unique<RawPeer>(acceptor);
+            peer->Read<ConnectionRequest>();
+            ConnectionAck ack;
+            ack.properties.auth = SessionAuth{"scripted", {}};
+            ack.properties.policy = SessionPolicy{false, EncodeInterval(300), EncodeInterval(keepalive), 65536};
+            peer->Send(ack);
+            EMPY_CHECK(connected.get() == "scripted");
+            return peer;
+        };
+        auto subscribe = [] (Client& client, RawPeer& peer, std::string topic)
+        {
+            auto result = client.Subscribe(std::move(topic));
+            auto request = peer.Read<ProfileRequest>();
+            peer.Send(ProfileAck{request.packetId, {}});
+            EMPY_CHECK(result.get().code == 0);
+            return request.entries.front().alias;
+        };
+        auto delivery = [] (uint16_t alias, std::string topic, uint16_t packetId, Buffer payload)
+        {
+            PublishRequest publication;
+            publication.alias = alias;
+            publication.topic = std::move(topic);
+            publication.qos = 1;
+            publication.packetId = packetId;
+            publication.payload = std::move(payload);
+            return publication;
+        };
+        {
+            Client client;
+            auto peer = serve(client);
+            auto alias = subscribe(client, *peer, "scripted/value");
+            size_t count = 0;
+            client.On<Receive>("scripted/#", [&] (const Receive&) { ++count; });
+            auto publication = delivery(alias, "scripted/value", 1, {1});
+            peer->Send(publication);
+            EMPY_CHECK(peer->Read<PublishAck>().packetId == 1);
+            publication.topic.clear();
+            publication.duplicate = true;
+            peer->Send(publication); // Identical content under the same PID is acknowledged only.
+            EMPY_CHECK(peer->Read<PublishAck>().packetId == 1);
+            peer->Send(ConnectionSync{});
+            EMPY_CHECK(!peer->Read<ConnectionSync>().token);
+            Until([&] { return count == 1; }, &client);
+            publication.payload[0] ^= 1;
+            peer->Send(publication);
+            EMPY_CHECK(peer->Read<ConnectionEnd>().reason.code == MMQP_REASON_INVALID_PID);
+            Until([&] { return !client.Connected(); });
+            EMPY_CHECK(count == 1);
+        }
+        {
+            Client client;
+            auto peer = serve(client);
+            auto alias = subscribe(client, *peer, "scripted/value");
+            peer->Send(delivery(alias, "scripted/value", 2, {2}));
+            EMPY_CHECK(peer->Read<PublishAck>().packetId == 2);
+            peer->Send(delivery(alias, {}, 1, {1})); // At or below the checkpoint without a cached receipt.
+            EMPY_CHECK(peer->Read<ConnectionEnd>().reason.code == MMQP_REASON_INVALID_PID);
+        }
+        {
+            Client client;
+            auto peer = serve(client);
+            peer->Send(ConnectionSync{Buffer(32, 0x42)}); // Tokens are valid only during the challenge.
+            EMPY_CHECK(peer->Read<ConnectionEnd>().reason.code == MMQP_REASON_MALFORMED_PACKET);
+        }
+        {
+            Client client;
+            auto peer = serve(client);
+            subscribe(client, *peer, "scripted/#");
+            peer->Send(delivery(0x8001, "scripted/wild", 1, {1}));
+            EMPY_CHECK(peer->Read<PublishAck>().packetId == 1);
+            peer->Send(delivery(5, "scripted/other", 2, {2})); // New broker aliases must be >= 32768.
+            EMPY_CHECK(peer->Read<ConnectionEnd>().reason.code == MMQP_REASON_INVALID_ALIAS);
+        }
+        {
+            ClientOptions recovering;
+            recovering.autoReconnect = true;
+            recovering.failoverEndpoints = {{"127.0.0.1", fakePort}};
+            Client client(recovering);
+            std::vector<Disconnect> disconnects;
+            client.On<Disconnect>([&] (const Disconnect& event) { disconnects.push_back(event); });
+            auto start = Clock::now();
+            auto peer = serve(client, 1);
+            // Stay silent: no ping arrives, so the client must give up after twice the keepalive.
+            EMPY_CHECK(peer->Read<ConnectionEnd>().reason.code == MMQP_REASON_KEEPALIVE_TIMEOUT);
+            EMPY_CHECK(Clock::now() - start >= std::chrono::milliseconds(1900));
+            Until([&] { return !disconnects.empty(); }, &client);
+            EMPY_CHECK(disconnects[0].reason.code == MMQP_REASON_KEEPALIVE_TIMEOUT && disconnects[0].reconnecting);
+            RawPeer successor(acceptor);
+            EMPY_CHECK(successor.Read<ConnectionRequest>().resume);
+        }
     }
 }

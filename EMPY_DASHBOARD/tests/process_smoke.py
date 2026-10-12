@@ -108,11 +108,14 @@ def main():
                 observed = state()
                 data = observed["sources"][0]["data"]
                 assert data["metrics"]["receivedBytes"] > 0 and data["metrics"]["sentBytes"] > 0
-                assert data["metrics"]["sessions"] == 2 and len(data["sessions"]) == 2
-                assert data["metrics"]["online"] == 1
-                assert any(session["subscriptions"] == 1 for session in data["sessions"])
-                assert any(session["publications"] == 3 for session in data["sessions"])
-                encoded = json.dumps(observed)
+                with request.urlopen(endpoint.replace("/api/state", "/api/sessions?size=100"), timeout=3) as response:
+                    page = json.loads(response.read())
+                sessions = [row["session"] for row in page["rows"]]
+                assert data["metrics"]["sessions"] == 2 and data["observedSessions"] == 2 and page["total"] == 2
+                assert data["metrics"]["online"] == 1 and "sessions" not in data
+                assert any(session["subscriptions"] == 1 for session in sessions)
+                assert any(session["publications"] == 3 for session in sessions)
+                encoded = json.dumps(observed) + json.dumps(page)
                 assert token not in encoded and "DASHBOARD-NO-PAYLOAD" not in encoded and "monitor/process" not in encoded
                 stop_process(broker)
                 until(lambda: state()["sources"][0]["state"] == "unreachable")

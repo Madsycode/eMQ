@@ -1,5 +1,7 @@
 const EMPY_NUMBER_FORMAT = new Intl.NumberFormat("en", { maximumFractionDigits: 1 });
-export const EMPY_GRAPH_LIMIT = 64;
+export const EMPY_GRAPH_LIMIT = 256;
+// Above this many brokers the topology switches to a compact ring without client dots.
+export const EMPY_DETAIL_NODES = 12;
 
 export function NumberText(value)
 {
@@ -41,37 +43,10 @@ export function Roles(session)
     return roles.length ? roles : ["Connected"];
 }
 
-export function SessionState(source, session)
-{
-    return source.state !== "online" ? "unknown" : session.online ? "online" : "offline";
-}
-
-export function Sessions(sources, filters = {})
-{
-    const search = (filters.search || "").toLocaleLowerCase();
-    const result = [];
-    for (const source of sources)
-    {
-        if (filters.broker && filters.broker !== "all" && filters.broker !== source.id) continue;
-        for (const session of source.data?.sessions || [])
-        {
-            const state = SessionState(source, session);
-            const roles = Roles(session);
-            if (filters.state && filters.state !== "all" && state !== filters.state) continue;
-            if (filters.role && filters.role !== "all" && !roles.includes(filters.role)) continue;
-            if (search && !`${session.identifier} ${source.name} ${source.data.identifier} ${session.realm}`.toLocaleLowerCase().includes(search)) continue;
-            result.push({ source, session, state, roles, key: `${source.id}/${session.identifier}` });
-        }
-    }
-    const ranks = { online: 0, unknown: 1, offline: 2 };
-    return result.sort((a, b) => ranks[a.state] - ranks[b.state] || a.source.name.localeCompare(b.source.name)
-        || a.session.identifier.localeCompare(b.session.identifier));
-}
-
 export function Totals(sources)
 {
     const online = sources.filter(source => source.state === "online" && source.data);
-    const sum = key => online.reduce((total, source) => total + source.data.metrics[key], 0);
+    const sum = key => online.reduce((total, source) => total + (source.data.metrics[key] ?? source.data[key] ?? 0), 0);
     const rates = online.filter(source => source.rates);
     const throughput = key => rates.length ? rates.reduce((total, source) => total + source.rates[key], 0) : null;
     return { reporting: online.length, configured: sources.length, clients: sum("online"), sessions: sum("sessions"),
@@ -79,7 +54,7 @@ export function Totals(sources)
         sentBytes: throughput("sentBytes"), publications: throughput("publications"),
         storedBytes: online.some(source => source.data.storedBytes != null)
             ? online.reduce((total, source) => total + (source.data.storedBytes || 0), 0) : null,
-        requests: online.reduce((total, source) => total + source.data.sessions.reduce((count, session) => count + session.requests, 0), 0),
+        requests: sum("requests"),
         omitted: sources.reduce((total, source) => total + (source.data?.omittedSessions || 0), 0) };
 }
 
@@ -98,7 +73,7 @@ export function Topology(sources)
         const key = BrokerKey(source);
         if (!nodes.has(key) || (nodes.get(key).state !== "online" && source.state === "online"))
             nodes.set(key, { key, name: source.name, identifier: source.data?.identifier || source.id,
-                source, state: source.state, clients: source.data?.sessions || [] });
+                source, state: source.state, clients: source.data?.preview || [] });
     }
     for (const source of sources)
     {
@@ -122,6 +97,53 @@ export function Topology(sources)
         edge.observed = reports.some(report => report.connected);
     }
     return { nodes: [...nodes.values()], edges: [...edges.values()] };
+}
+
+// Full-mesh link health per cluster manifest: confirmed links versus n(n-1)/2.
+export function Mesh(sources, topology = Topology(sources))
+{
+    const members = new Map();
+    for (const source of sources)
+    {
+        const cluster = source.data?.cluster;
+        if (cluster) members.set(cluster.identifier, Math.max(members.get(cluster.identifier) || 0, cluster.peers.length + 1));
+    }
+    const expected = [...members.values()].reduce((total, count) => total + count * (count - 1) / 2, 0);
+    const confirmed = topology.edges.filter(edge => edge.state === "connected").length;
+    return { clusters: members.size, brokers: [...members.values()].reduce((total, count) => total + count, 0), expected, confirmed };
+}
+
+export const EMPY_BROKER_COLUMNS =
+[
+    ["name", "Broker"], ["state", "State"], ["clients", "Clients"], ["sessions", "Sessions"], ["ingress", "Ingress"],
+    ["egress", "Egress"], ["messages", "Msg/s"], ["pending", "Pending"], ["links", "Peer links"], ["leases", "Leases"],
+    ["latency", "RTT"], ["uptime", "Uptime"]
+];
+
+export function BrokerRows(sources, { search = "", sort = "name", descending = false } = {})
+{
+    const text = search.toLocaleLowerCase();
+    const ranks = { online: 0, stale: 1, duplicate: 2, connecting: 3, unreachable: 4 };
+    const rows = sources.filter(source => !text || `${source.name} ${source.id} ${source.data?.identifier || ""}`.toLocaleLowerCase().includes(text))
+        .map(source =>
+        {
+            const data = source.data, live = source.state === "online" && data;
+            const peers = data?.cluster?.peers || [];
+            return { source, name: source.name, state: ranks[source.state] ?? 5,
+                clients: live ? data.metrics.online : null, sessions: live ? data.metrics.sessions : null,
+                ingress: source.rates?.receivedBytes ?? null, egress: source.rates?.sentBytes ?? null,
+                messages: source.rates?.publications ?? null, pending: live ? data.metrics.pending : null,
+                links: data?.cluster ? peers.filter(peer => peer.connected).length : null, peers: peers.length,
+                leases: data?.cluster ? data.cluster.activeLeases : null, latency: source.latencyMs ?? null,
+                uptime: data ? data.uptimeMs : null };
+        });
+    const direction = descending ? -1 : 1;
+    return rows.sort((a, b) =>
+    {
+        const left = a[sort], right = b[sort];
+        if (left == null || right == null) return left == null && right == null ? a.name.localeCompare(b.name) : left == null ? 1 : -1;
+        return (typeof left === "string" ? left.localeCompare(right) : left - right) * direction || a.name.localeCompare(b.name);
+    });
 }
 
 export function Element(tag, className = "", text = null)

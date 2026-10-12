@@ -1,19 +1,21 @@
-import { Element, NumberText, Bytes, ByteText, Duration, Sessions, Totals, Topology, EMPY_GRAPH_LIMIT } from "./model.js";
+import { Element, NumberText, Bytes, ByteText, Duration, Totals, Topology, Mesh, BrokerRows, EMPY_BROKER_COLUMNS, EMPY_GRAPH_LIMIT } from "./model.js";
 import { Sparkline, TrafficChart } from "./charts.js";
 import { NetworkGraph } from "./topology.js";
 
 const EMPY_VIEWS =
 {
     overview: ["Network overview", "A live view of your brokers, connections and message flow."],
-    brokers: ["Broker inventory", "Availability, transport and resource use across your network."],
+    brokers: ["Broker inventory", "Availability, load, peer links and resource use across your fabric."],
     sessions: ["Client sessions", "Inspect connected clients, resumable state and in-flight exchanges."],
     activity: ["Network activity", "Recent changes observed by the monitoring collector."]
 };
+const EMPY_PAGE_SIZE = 25;
 
 const Get = id => document.getElementById(id);
 const Text = (id, value) => { Get(id).textContent = value; };
 const Title = value => value.charAt(0).toUpperCase() + value.slice(1);
 const Time = value => new Date(value).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+const Rate = value => value == null ? "—" : `${NumberText(value)} msg/s`;
 let m_State = null;
 let m_Error = "";
 let m_LastReceived = 0;
@@ -25,6 +27,11 @@ let m_SelectedSession = null;
 let m_Page = 0;
 let m_View = "overview";
 let m_FilterKey = "";
+let m_Sessions = null;
+let m_Preview = null;
+let m_Detail = undefined;
+let m_SessionVersion = 0;
+let m_BrokerSort = { sort: "name", descending: false };
 const graph = new NetworkGraph(Get("topology"), SelectBroker);
 
 function Sources()
@@ -89,7 +96,7 @@ function ShowSessions(id)
     Get("session-search").value = "";
     m_Page = 0;
     location.hash = "sessions";
-    RenderTables();
+    LoadSessions();
 }
 
 function SetView()
@@ -109,6 +116,7 @@ function SetView()
     Text("page-subtitle", EMPY_VIEWS[m_View][1]);
     document.title = `${EMPY_VIEWS[m_View][0]} · Empy`;
     Render();
+    LoadSessions();
 }
 
 function RenderStatus()
@@ -133,27 +141,38 @@ function RenderStatus()
     for (const badge of document.querySelectorAll(".tiny-badge")) badge.textContent = m_Paused ? "PAUSED" : m_Error ? "STALE" : "LIVE";
 }
 
-function RenderMetrics(sources)
+function RenderMetrics(sources, mesh)
 {
     const totals = Totals(sources);
     Text("stat-brokers", NumberText(totals.reporting));
     Text("stat-brokers-total", `/ ${totals.configured}`);
-    Text("stat-brokers-note", totals.reporting === totals.configured ? "All telemetry sources reporting" : `${totals.configured - totals.reporting} sources need attention`);
+    Text("stat-brokers-note", mesh.expected ? `${NumberText(mesh.confirmed)} of ${NumberText(mesh.expected)} possible links active`
+        : totals.reporting === totals.configured ? "All telemetry sources reporting" : `${totals.configured - totals.reporting} sources need attention`);
     Text("stat-clients", totals.reporting ? NumberText(totals.clients) : "—");
     Text("stat-sessions-note", totals.reporting ? `${NumberText(totals.sessions)} sessions · ${NumberText(totals.sessions - totals.clients)} offline` : "Awaiting broker observations");
     const ingress = Bytes(totals.receivedBytes, true);
     Text("stat-ingress", ingress.value);
     Text("stat-ingress-unit", ingress.unit);
     Text("stat-egress", totals.sentBytes == null ? "Waiting for a second sample" : `${ByteText(totals.sentBytes, true)} egress`);
+    Text("stat-messages", totals.publications == null ? "—" : NumberText(totals.publications));
+    const busiest = sources.filter(source => source.rates).sort((a, b) => b.rates.publications - a.rates.publications)[0];
+    Text("stat-messages-note", busiest ? `Busiest: ${busiest.name} · ${Rate(busiest.rates.publications)}` : "Accepted client publications");
     Text("stat-pending", totals.reporting ? NumberText(totals.pending) : "—");
     Text("stat-requests", totals.reporting ? `${NumberText(totals.requests)} active request${totals.requests === 1 ? "" : "s"} · ${totals.storedBytes == null ? "Memory state" : ByteText(totals.storedBytes) + " stored"}` : "Awaiting broker observations");
     Text("nav-brokers", NumberText(sources.length));
     Text("nav-sessions", totals.reporting ? NumberText(totals.sessions) : "—");
-    Text("chart-in", ByteText(totals.receivedBytes, true));
+    const metric = Get("history-metric").value;
+    Text("chart-in", metric === "messages" ? Rate(totals.publications) : ByteText(totals.receivedBytes, true));
     Text("chart-out", ByteText(totals.sentBytes, true));
-    Get("broker-health").replaceChildren(...sources.map(source => Element("i", source.state === "online" ? "" : "unavailable")));
+    Get("chart-out-item").hidden = metric === "messages";
+    Text("chart-in-label", metric === "messages" ? "Publications" : "Ingress");
+    // One bar per broker would overflow; show at most 24, then the failing share.
+    const bars = sources.length <= 24 ? sources.map(source => source.state === "online")
+        : Array.from({ length: 24 }, (_, index) => index < Math.round(24 * totals.reporting / Math.max(1, sources.length)));
+    Get("broker-health").replaceChildren(...bars.map(online => Element("i", online ? "" : "unavailable")));
     Sparkline(Get("client-spark"), m_State.history, "online", "#a099ff");
     Sparkline(Get("traffic-spark"), m_State.history, "receivedBytes", "#75e5bd");
+    Sparkline(Get("message-spark"), m_State.history, "publications", "#efbd76");
 }
 
 function RenderBrokerDetail(sources)
@@ -175,14 +194,17 @@ function RenderBrokerDetail(sources)
     {
         const links = data.cluster?.peers.filter(peer => peer.connected).length || 0;
         const rows = [["Uptime", Duration(data.uptimeMs)], ["Online clients", NumberText(data.metrics.online)],
-            ["Publications", NumberText(data.metrics.publications)], ["Retransmissions", NumberText(data.metrics.retransmitted)],
+            ["Message rate", Rate(source.rates?.publications)], ["Publications", NumberText(data.metrics.publications)],
+            ["Forwarded", NumberText(data.metrics.forwarded)], ["Retransmissions", NumberText(data.metrics.retransmitted)],
             ["Rejected", NumberText(data.metrics.rejected)], ["Telemetry RTT", source.latencyMs == null ? "—" : `${NumberText(source.latencyMs)} ms`]];
         if (data.cluster)
             rows.push(["Peer links", `${links} / ${data.cluster.peers.length}`], ["Active leases", NumberText(data.cluster.activeLeases)],
-                ["Routing epoch", data.cluster.epoch], ["Replication", `${data.cluster.replicas} replicas`]);
+                ["Routing epoch", data.cluster.epoch], ["Placement", `${data.cluster.shards} shards · ${data.cluster.replicas} replicas · fan-out ${data.cluster.fanout}`]);
         else rows.push(["Persistence", data.durable ? "Enabled" : "Memory"], ["Authentication", data.authenticationRequired ? "Required" : "Optional"]);
         fragment.append(DetailList(rows), Element("hr", "detail-divider"));
         fragment.append(Capacity("Session capacity", data.metrics.sessions, data.limits.sessions));
+        const idle = data.cluster?.peers.filter(peer => !peer.connected).length || 0;
+        if (idle) fragment.append(Element("p", "detail-note", `${idle} peer${idle === 1 ? "" : "s"} idle · links are dialed when brokers exchange work`));
         const inspect = Action("Inspect sessions  →", () => ShowSessions(source.id), "button subtle detail-action");
         inspect.id = "inspect-broker-sessions";
         fragment.append(inspect);
@@ -191,39 +213,55 @@ function RenderBrokerDetail(sources)
     container.replaceChildren(fragment);
 }
 
-function RenderBrokerCards(sources)
+function RenderBrokerTable(sources)
 {
-    Text("broker-inventory-note", `${sources.length} configured telemetry sources`);
-    const fragment = document.createDocumentFragment();
-    for (const source of sources)
+    const rows = BrokerRows(sources, { search: Get("broker-search").value, ...m_BrokerSort });
+    Text("broker-inventory-note", `${NumberText(rows.length)} of ${NumberText(sources.length)} telemetry sources`);
+    const focused = Get("broker-table").contains(document.activeElement) ? document.activeElement.dataset.key : null;
+    if (!rows.length) { Get("broker-table").replaceChildren(Empty("No brokers match this search")); return; }
+    const table = Element("table", "broker-table");
+    const header = Element("tr");
+    for (const [key, label] of EMPY_BROKER_COLUMNS)
     {
-        const card = Element("article", "panel broker-card");
-        const heading = Element("div", "broker-card-title");
-        heading.append(Element("h2", "", source.name), Badge(Title(source.state), source.state));
-        card.append(heading);
-        const data = source.data;
-        if (data)
+        const th = Element("th");
+        th.scope = "col";
+        const active = m_BrokerSort.sort === key;
+        th.setAttribute("aria-sort", active ? (m_BrokerSort.descending ? "descending" : "ascending") : "none");
+        const button = Action(`${label}${active ? (m_BrokerSort.descending ? " ↓" : " ↑") : ""}`, () =>
         {
-            card.append(Element("div", "detail-endpoint mono", `${data.identifier} · ${data.address}:${data.port}`));
-            const badges = Element("div", "badges");
-            badges.append(Badge(data.transport), Badge(data.durable ? "Persistent" : "Memory"), Badge(data.cluster ? `Epoch ${data.cluster.epoch}` : "Standalone"));
-            card.append(badges);
-            card.append(DetailList([["Clients online", NumberText(data.metrics.online)], ["Sessions", NumberText(data.metrics.sessions)],
-                ["Ingress", ByteText(source.rates?.receivedBytes, true)], ["Egress", ByteText(source.rates?.sentBytes, true)],
-                ["Pending QoS 1", NumberText(data.metrics.pending)], ["Stored record bytes", ByteText(data.storedBytes)],
-                ["Retained memory", data.cluster ? "In cluster store" : ByteText(data.metrics.retainedBytes)],
-                ["Uptime", Duration(data.uptimeMs)], ["Observation age", Duration(source.ageMs)]]));
-            card.append(Capacity("Session capacity", data.metrics.sessions, data.limits.sessions));
-            card.append(Element("hr", "detail-divider"));
-        }
-        else card.append(Empty(source.error || "Connecting to broker"));
-        if (source.error && data) card.append(Element("p", "detail-endpoint", source.error));
-        const inspect = Action("View in topology  →", () => { m_SelectedBroker = source.id; location.hash = "overview"; Render(); });
-        inspect.id = `inspect-broker-${source.id}`;
-        card.append(inspect);
-        fragment.append(card);
+            m_BrokerSort = { sort: key, descending: active ? !m_BrokerSort.descending : key !== "name" && key !== "state" };
+            RenderBrokerTable(Sources());
+        }, "sort-button");
+        button.dataset.key = `sort-${key}`;
+        th.append(button);
+        header.append(th);
     }
-    Get("broker-grid").replaceChildren(fragment);
+    const head = Element("thead");
+    head.append(header);
+    const body = Element("tbody");
+    for (const row of rows)
+    {
+        const line = Element("tr");
+        const name = Element("td");
+        const link = Action(row.name, () => { m_SelectedBroker = row.source.id; location.hash = "overview"; }, "session-link");
+        link.dataset.key = `broker-${row.source.id}`;
+        link.title = row.source.data?.identifier || row.source.id;
+        name.append(link);
+        const state = Element("td");
+        state.append(Badge(Title(row.source.state), row.source.state));
+        const linkText = row.links == null ? "—" : `${row.links} / ${row.peers}`;
+        // Links are dialed on demand, so fewer active links than peers is normal.
+        const links = Element("td", "mono", linkText);
+        line.append(name, state, Element("td", "mono", NumberText(row.clients)), Element("td", "mono", NumberText(row.sessions)),
+            Element("td", "mono", ByteText(row.ingress, true)), Element("td", "mono", ByteText(row.egress, true)),
+            Element("td", "mono", NumberText(row.messages)), Element("td", "mono", NumberText(row.pending)), links,
+            Element("td", "mono", NumberText(row.leases)), Element("td", "mono", row.latency == null ? "—" : `${NumberText(row.latency)} ms`),
+            Element("td", "mono", Duration(row.uptime)));
+        body.append(line);
+    }
+    table.append(head, body);
+    Get("broker-table").replaceChildren(table);
+    if (focused) Get("broker-table").querySelector(`[data-key="${CSS.escape(focused)}"]`)?.focus({ preventScroll: true });
 }
 
 function RenderEvents(container, events)
@@ -255,8 +293,7 @@ function Table(rows, container, preview = false)
     const table = Element("table");
     const head = Element("thead");
     const header = Element("tr");
-    const columns = ["Session", "Broker", "State", "Role", "Received", "Sent", "In flight"];
-    for (const label of columns)
+    for (const label of ["Session", "Broker", "State", "Role", "Received", "Sent", "In flight"])
     {
         const th = Element("th", "", label);
         th.scope = "col";
@@ -273,8 +310,10 @@ function Table(rows, container, preview = false)
         const button = Action(`${row.session.identifier.slice(0, 8)}…`, () =>
         {
             m_SelectedSession = row.key;
+            m_Detail = row;
             if (preview) location.hash = "sessions";
             RenderSessionDetail();
+            LoadSessions();
             Get("session-inspector").scrollIntoView({ block: "nearest" });
         }, "session-link");
         button.title = row.session.identifier;
@@ -291,6 +330,40 @@ function Table(rows, container, preview = false)
     table.append(body);
     container.replaceChildren(table);
     if (focused) [...container.querySelectorAll("[data-session]")].find(button => button.dataset.session === focused)?.focus({ preventScroll: true });
+}
+
+function SessionFilters()
+{
+    return { broker: Get("session-broker").value, state: Get("session-state").value, role: Get("session-role").value,
+        search: Get("session-search").value.slice(0, 128) };
+}
+
+// Sessions are filtered and paged by the collector, so large fabrics never ship every session to the browser.
+async function LoadSessions()
+{
+    if (!m_State || (m_View !== "overview" && m_View !== "sessions")) return;
+    const version = ++m_SessionVersion;
+    const query = (values) => "/api/sessions?" + new URLSearchParams(values);
+    const fetchJson = async url =>
+    {
+        const response = await fetch(url, { cache: "no-store" });
+        if (response.status === 404) return null;
+        if (!response.ok) throw new Error("Session query failed");
+        return response.json();
+    };
+    try
+    {
+        const [sessions, preview, detail] = await Promise.all([
+            m_View === "sessions" ? fetchJson(query({ ...SessionFilters(), page: m_Page, size: EMPY_PAGE_SIZE })) : m_Sessions,
+            m_View === "overview" ? fetchJson(query({ size: 5 })) : m_Preview,
+            m_SelectedSession ? fetchJson("/api/session?" + new URLSearchParams({ key: m_SelectedSession })) : null]);
+        if (version !== m_SessionVersion) return;
+        m_Sessions = sessions;
+        m_Preview = preview;
+        m_Detail = m_SelectedSession ? detail : undefined;
+    }
+    catch { if (version !== m_SessionVersion) return; }
+    RenderTables();
 }
 
 function RenderTables()
@@ -312,26 +385,25 @@ function RenderTables()
         select.value = [...select.options].some(option => option.value === selected) ? selected : "all";
         m_FilterKey = filterKey;
     }
-    const allRows = Sessions(sources);
-    if (m_View === "overview") Table(allRows.slice(0, 5), Get("session-preview"), true);
-    const rows = Sessions(sources, { search: Get("session-search").value, broker: Get("session-broker").value,
-        state: Get("session-state").value, role: Get("session-role").value });
-    const pages = Math.max(1, Math.ceil(rows.length / 25));
-    m_Page = Math.min(m_Page, pages - 1);
-    Table(rows.slice(m_Page * 25, (m_Page + 1) * 25), Get("session-table"));
-    Text("session-count", `${NumberText(rows.length)} matching · ${NumberText(allRows.length)} observations${Totals(sources).omitted ? " · snapshot truncated" : ""}`);
-    Text("session-page", `${m_Page + 1} / ${pages}`);
-    Get("previous-page").disabled = m_Page === 0;
-    Get("next-page").disabled = m_Page === pages - 1;
+    if (m_View === "overview" && m_Preview) Table(m_Preview.rows, Get("session-preview"), true);
+    if (m_View === "sessions" && m_Sessions)
+    {
+        m_Page = m_Sessions.page;
+        Table(m_Sessions.rows, Get("session-table"));
+        Text("session-count", `${NumberText(m_Sessions.total)} matching · ${NumberText(m_Sessions.observed)} observations${Totals(sources).omitted ? " · snapshot truncated" : ""}`);
+        Text("session-page", `${m_Sessions.page + 1} / ${m_Sessions.pages}`);
+        Get("previous-page").disabled = m_Sessions.page === 0;
+        Get("next-page").disabled = m_Sessions.page >= m_Sessions.pages - 1;
+    }
     RenderSessionDetail();
 }
 
 function RenderSessionDetail()
 {
-    const row = Sessions(Sources()).find(value => value.key === m_SelectedSession);
+    const row = m_Detail;
     const panel = Get("session-inspector");
     panel.hidden = !m_SelectedSession;
-    if (!m_SelectedSession) return;
+    if (!m_SelectedSession || row === undefined) return;
     if (!row)
     {
         Text("session-detail-id", m_SelectedSession.split("/").at(-1));
@@ -369,23 +441,27 @@ function Render()
     RenderStatus();
     if (!m_State) return;
     const sources = Sources();
+    const topology = Topology(sources);
+    const mesh = Mesh(sources, topology);
     Text("workspace-name", m_State.name);
     Text("footer-update", `Collector updated ${Time(m_State.generatedAt)} · ${m_State.intervalMs / 1000}s polling`);
-    RenderMetrics(sources);
+    RenderMetrics(sources, mesh);
     if (m_View === "overview")
     {
         RenderBrokerDetail(sources);
-        const topology = Topology(sources);
-        const clients = sources.reduce((sum, source) => sum + (source.data?.sessions.length || 0), 0);
-        Text("topology-summary", `${topology.nodes.length} brokers · ${clients} observed sessions · ${topology.edges.filter(edge => edge.state === "connected").length} confirmed links`
+        const clients = sources.reduce((sum, source) => sum + (source.state === "online" ? source.data?.metrics.online || 0 : 0), 0);
+        const failing = topology.edges.filter(edge => edge.state !== "connected" && edge.observed).length;
+        Text("topology-summary", `${topology.nodes.length} brokers · ${NumberText(clients)} online clients · `
+            + (mesh.expected ? `${NumberText(mesh.confirmed)} of ${NumberText(mesh.expected)} possible links active` : `${mesh.confirmed} confirmed links`)
+            + (failing ? ` · ${failing} one-sided` : "")
             + (topology.nodes.length > EMPY_GRAPH_LIMIT ? ` · first ${EMPY_GRAPH_LIMIT} nodes shown` : ""));
         Get("graph-empty").hidden = sources.some(source => source.data);
         graph.Render(sources.some(source => source.data) ? sources : [], m_SelectedBroker, Get("show-clients").checked);
-        TrafficChart(Get("traffic-chart"), m_State.history, Number(Get("history-window").value));
+        TrafficChart(Get("traffic-chart"), m_State.history, Number(Get("history-window").value), Get("history-metric").value);
         Text("chart-caption", `Live sources only · ${sources.filter(source => source.state === "online").length}/${sources.length} reporting · gaps indicate missing samples · process-local counters`);
         RenderEvents(Get("recent-events"), m_State.events.slice(0, 4));
     }
-    if (m_View === "brokers") RenderBrokerCards(sources);
+    if (m_View === "brokers") RenderBrokerTable(sources);
     if (m_View === "activity") RenderEvents(Get("all-events"), m_State.events);
     if (m_View === "overview" || m_View === "sessions") RenderTables();
     if (focusedId && document.activeElement?.id !== focusedId) Get(focusedId)?.focus({ preventScroll: true });
@@ -399,6 +475,7 @@ async function Refresh()
     Get("refresh").disabled = true;
     const abort = new AbortController();
     const timeout = setTimeout(() => abort.abort(), 4000);
+    let updated = false;
     try
     {
         const response = await fetch("/api/state", { cache: "no-store", signal: abort.signal });
@@ -410,6 +487,7 @@ async function Refresh()
             m_State = state;
             m_Error = "";
             m_LastReceived = performance.now();
+            updated = true;
         }
     }
     catch (error) { if (version === m_RequestVersion) m_Error = error.message; }
@@ -419,9 +497,11 @@ async function Refresh()
         m_InFlight = false;
         Get("refresh").disabled = false;
         Render();
+        if (updated) LoadSessions();
     }
 }
 
+const ReloadSessions = () => { m_Page = 0; LoadSessions(); };
 Get("refresh").addEventListener("click", Refresh);
 Get("pause").addEventListener("click", () =>
 {
@@ -434,14 +514,17 @@ Get("pause").addEventListener("click", () =>
 });
 Get("show-clients").addEventListener("change", Render);
 Get("history-window").addEventListener("change", Render);
+Get("history-metric").addEventListener("change", Render);
+Get("broker-search").addEventListener("input", () => RenderBrokerTable(Sources()));
 Get("zoom-in").addEventListener("click", () => graph.Zoom(0.8));
 Get("zoom-out").addEventListener("click", () => graph.Zoom(1.25));
 Get("zoom-fit").addEventListener("click", () => graph.Fit());
-for (const id of ["session-search", "session-broker", "session-state", "session-role"])
-    Get(id).addEventListener(id === "session-search" ? "input" : "change", () => { m_Page = 0; RenderTables(); });
-Get("previous-page").addEventListener("click", () => { --m_Page; RenderTables(); });
-Get("next-page").addEventListener("click", () => { ++m_Page; RenderTables(); });
-Get("close-session").addEventListener("click", () => { m_SelectedSession = null; RenderSessionDetail(); });
+let searchTimer;
+Get("session-search").addEventListener("input", () => { clearTimeout(searchTimer); searchTimer = setTimeout(ReloadSessions, 200); });
+for (const id of ["session-broker", "session-state", "session-role"]) Get(id).addEventListener("change", ReloadSessions);
+Get("previous-page").addEventListener("click", () => { m_Page = Math.max(0, m_Page - 1); LoadSessions(); });
+Get("next-page").addEventListener("click", () => { ++m_Page; LoadSessions(); });
+Get("close-session").addEventListener("click", () => { m_SelectedSession = null; m_Detail = undefined; RenderSessionDetail(); });
 Get("export").addEventListener("click", () =>
 {
     if (!m_State) return;

@@ -1,10 +1,13 @@
 #include <eClient/Runtime/Client.h>
 #include <eMQ/Common/State.h>
 #include <eMQ/Network/IOContext.h>
+#include <algorithm>
 #include <deque>
 
 namespace eMQ
 {
+    inline constexpr size_t MMQP_CLIENT_RECEIPTS = 256;
+
     struct Client::Impl
     {
         enum class Phase { Offline, Transport, Challenge, Ack, Active };
@@ -26,10 +29,11 @@ namespace eMQ
         Phase phase = Phase::Offline;
         CodecOptions codec;
         ProfileTable profiles;
-        PacketSequence publications;
+        PublicationSequence publications;
         PacketSequence profileIds;
         CorrelationIds requestIds;
         ReceiveWindow received;
+        std::map<uint64_t, Digest> receipts; // keyed by incoming 64-bit sequence
         PendingQueue pending;
         std::map<uint16_t, std::shared_ptr<std::promise<Reason>>> results;
         std::deque<ProfileTask> profileTasks;
@@ -41,11 +45,14 @@ namespace eMQ
         TimePoint deadline;
         Reason closeReason{MMQP_REASON_UNSPECIFIED, "Transport disconnected"};
         std::atomic_bool active = false;
-        bool stopping = false;
+        std::atomic_bool stopping = false;
         bool resume = false;
         bool resumable = true;
         bool manualDisconnect = false;
         TimePoint reconnectAt{};
+        TimePoint lastReceive{};
+        TimePoint lastSend{};
+        std::chrono::milliseconds keepalive{0};
         size_t reconnectIndex = 0;
 
         Impl(Client& service, ClientOptions settings):
@@ -83,7 +90,31 @@ namespace eMQ
 
         bool Write(const Message& message)
         {
-            return connection && connection->Send(Codec::Encode(message, codec));
+            if (!connection || !connection->Send(Codec::Encode(message, codec))) return false;
+            lastSend = Clock::now();
+            return true;
+        }
+
+        static Digest Receipt(PublishRequest& publication)
+        {
+            // Mirror the broker receipt: resolved topic, alias 1 and DUP clear.
+            auto alias = publication.alias;
+            auto duplicate = publication.duplicate;
+            publication.alias = 1;
+            publication.duplicate = false;
+            auto digest = Sha256(Codec::Encode(publication, {true, UINT32_MAX}));
+            publication.alias = alias;
+            publication.duplicate = duplicate;
+            return digest;
+        }
+
+        void Acknowledge(uint16_t packetId, const Digest& digest)
+        {
+            auto sequence = received.Sequence(packetId);
+            received.Commit(packetId);
+            receipts[sequence] = digest;
+            while (receipts.size() > MMQP_CLIENT_RECEIPTS) receipts.erase(receipts.begin());
+            this->Write(PublishAck{packetId, {}});
         }
 
         void Closed(const std::string& text)
@@ -113,7 +144,8 @@ namespace eMQ
         void Fail(const ProtocolError& error)
         {
             closeReason = {error.reason, error.what()};
-            if (!(options.autoReconnect && phase != Phase::Active
+            // Broker silence leaves client state consistent, so the session may still resume.
+            if (error.reason != MMQP_REASON_KEEPALIVE_TIMEOUT && !(options.autoReconnect && phase != Phase::Active
                 && (error.reason == MMQP_REASON_BUSY || error.reason == MMQP_REASON_TIMEOUT))) resumable = false;
             if (connection)
             {
@@ -173,10 +205,11 @@ namespace eMQ
             {
                 identifier.clear();
                 profiles = {};
-                publications = PacketSequence{};
+                publications = PublicationSequence{};
                 requestIds = CorrelationIds{};
                 profileIds = PacketSequence(options.properties.profile ? options.properties.profile->packetId : 0);
                 received = ReceiveWindow(!options.transport.quic);
+                receipts.clear();
                 negotiated.reset();
                 pending = PendingQueue{};
                 pending.maxCount = options.maxInflight;
@@ -226,6 +259,8 @@ namespace eMQ
             codec.maxPacket = std::min(codec.maxPacket, *ack.properties.policy->maxPacket);
             connection->SetLimit(codec.maxPacket);
             if (!resume && options.properties.profile) profiles.Apply(*options.properties.profile, options.maxProfiles);
+            keepalive = std::chrono::seconds(DecodeInterval(*ack.properties.policy->keepalive));
+            lastReceive = lastSend = Clock::now();
             phase = Phase::Active;
             active = true;
             negotiated = ack.properties.quic;
@@ -319,9 +354,10 @@ namespace eMQ
             publication.topic = ParseTopic(publication.topic).filter;
             if (!profiles.Registration(publication.topic, publication.type))
                 throw ProtocolError("Register the topic or responder profile before publishing", MMQP_REASON_UNAUTHORIZED);
-            auto topic = publication.topic;
-            publication.alias = profiles.publishers.Candidate(topic);
-            publication.packetId = publication.qos ? publications.Peek() : 0;
+            publication.alias = profiles.publishers.Candidate(publication.topic);
+            auto qos = publication.qos;
+            auto packetId = qos ? publications.Peek() : uint16_t{0};
+            publication.packetId = packetId;
             publication.duplicate = false;
             if (publication.type == MMQP_PUBREQ_TYPE_REQ)
             {
@@ -330,42 +366,66 @@ namespace eMQ
                     throw ProtocolError("Correlation ID already used in this session", MMQP_REASON_INVALID_CORRELATION);
             }
             if (options.cipher) options.cipher->Encrypt(publication, options.keyEpoch);
-            if (profiles.publishers.Confirmed(publication.alias)) publication.topic.clear();
+            // A confirmed alias is already mapped, so its topic is omitted and needs no remapping.
+            bool confirmed = profiles.publishers.Confirmed(publication.alias);
+            if (confirmed) publication.topic.clear();
             auto bytes = Codec::Encode(publication, codec);
-            if (bytes.size() > connection->Capacity() - connection->Queued()
-                || (publication.qos && !pending.CanAdd(bytes.size(), publication.packetId)))
+            auto capacity = connection->Capacity();
+            auto queued = std::min(capacity, connection->Queued());
+            // Match the strictest transport admission: QUIC rejects bytes >= remaining space.
+            if (bytes.size() >= capacity - queued || (qos && !pending.CanAdd(bytes.size(), publications.Issued() + 1)))
                 throw ProtocolError("Client send budget exhausted", MMQP_REASON_BUSY);
-            auto packetId = publication.packetId;
             auto size = bytes.size();
             if (publication.type == MMQP_PUBREQ_TYPE_REQ) requestIds.Claim(publication.correlationId);
             if (!connection->Send(std::move(bytes)))
                 throw ProtocolError("Transport rejected publication", MMQP_REASON_BUSY);
-            profiles.publishers.Map(publication.alias, topic);
-            if (publication.qos)
+            auto now = Clock::now();
+            lastSend = now;
+            if (!confirmed) profiles.publishers.Map(publication.alias, publication.topic);
+            if (!qos)
             {
-                publications.Next();
-                pending.Add(publication, size, Clock::now() + std::chrono::milliseconds(options.retryInterval),
-                    Clock::now() + std::chrono::milliseconds(options.operationTimeout));
-                results.emplace(packetId, result);
+                result->set_value({});
+                return;
             }
-            if (!publication.qos) result->set_value({});
+            publications.Next();
+            pending.Add(std::move(publication), publications.Issued(), size, now + std::chrono::milliseconds(options.retryInterval),
+                now + std::chrono::milliseconds(options.operationTimeout));
+            results.emplace(packetId, result);
         }
 
         void Publication(PublishRequest publication)
         {
-            if (publication.qos && received.Inspect(publication.packetId) == Reception::OutsideWindow)
-                throw ProtocolError("Publication exceeds the receive window", MMQP_REASON_INVALID_PID);
-            if (publication.qos && received.Inspect(publication.packetId) == Reception::Duplicate)
-            {
-                this->Write(PublishAck{publication.packetId, {}});
-                return;
-            }
             bool mapping = !publication.topic.empty();
-            if (mapping) profiles.subscribers.Map(publication.alias, publication.topic, true);
-            else publication.topic = profiles.subscribers.Resolve(publication.alias);
+            if (!mapping) publication.topic = profiles.subscribers.Resolve(publication.alias);
+            Digest digest{};
+            if (publication.qos)
+            {
+                auto state = received.Inspect(publication.packetId);
+                if (state == Reception::OutsideWindow)
+                    throw ProtocolError("Publication exceeds the receive window", MMQP_REASON_INVALID_PID);
+                digest = Receipt(publication);
+                if (state == Reception::Duplicate)
+                {
+                    // Only an identical retransmission is acknowledged without redelivery.
+                    auto found = receipts.find(received.Sequence(publication.packetId));
+                    if (found == receipts.end())
+                        throw ProtocolError("Delivery PID is older than the receipt cache", MMQP_REASON_INVALID_PID);
+                    if (!SecureEqual(found->second, digest))
+                        throw ProtocolError("Delivery PID was reused for different content", MMQP_REASON_INVALID_PID);
+                    this->Write(PublishAck{publication.packetId, {}});
+                    return;
+                }
+            }
+            if (mapping)
+            {
+                // Clients allocate concrete subscriber aliases below 0x8000; new broker-assigned ones lie above.
+                if (publication.alias < 0x8000 && profiles.subscribers.Find(publication.topic) != publication.alias)
+                    throw ProtocolError("Broker-assigned subscriber alias is outside 32768..65535", MMQP_REASON_INVALID_ALIAS);
+                profiles.subscribers.Map(publication.alias, publication.topic, true);
+            }
             bool authorized = publication.type == MMQP_PUBREQ_TYPE_RES
                 ? profiles.Registration(publication.topic, MMQP_PUBREQ_TYPE_REQ).has_value()
-                : !profiles.Subscriptions(publication.topic, publication.qos, publication.type == MMQP_PUBREQ_TYPE_REQ).empty();
+                : profiles.Subscribed(publication.topic, publication.qos, publication.type == MMQP_PUBREQ_TYPE_REQ);
             if (!authorized) throw ProtocolError("Received publication is outside the client profile", MMQP_REASON_UNAUTHORIZED);
             if (publication.type == MMQP_PUBREQ_TYPE_RES && !requestIds.Contains(publication.correlationId))
                 throw ProtocolError("Response names an unknown request", MMQP_REASON_INVALID_CORRELATION);
@@ -378,11 +438,7 @@ namespace eMQ
                 {
                     // Retention can redeliver an authenticated envelope under a new broker PID.
                     if (mapping) this->Write(ProfileSync{publication.alias, publication.topic, {}});
-                    if (publication.qos)
-                    {
-                        received.Commit(publication.packetId);
-                        this->Write(PublishAck{publication.packetId, {}});
-                    }
+                    if (publication.qos) this->Acknowledge(publication.packetId, digest);
                     return;
                 }
                 decrypted = true;
@@ -396,15 +452,12 @@ namespace eMQ
             auto bytes = publication.topic.size() + publication.payload.size();
             if (!owner.TryPost<eMQ::Receive>(bytes, std::move(publication), decrypted))
                 throw ProtocolError("Application receive queue is full; poll events before accepting more data", MMQP_REASON_BUSY);
-            if (qos)
-            {
-                received.Commit(packetId);
-                this->Write(PublishAck{packetId, {}});
-            }
+            if (qos) this->Acknowledge(packetId, digest);
         }
 
         void Receive(std::span<const uint8_t> bytes)
         {
+            lastReceive = Clock::now();
             try
             {
                 auto message = Codec::Decode(bytes, codec);
@@ -434,7 +487,7 @@ namespace eMQ
                     else if constexpr (std::is_same_v<Type, ProfileAck>) this->ProfileAcked(value);
                     else if constexpr (std::is_same_v<Type, PublishAck>)
                     {
-                        if (!pending.Remove(value.packetId) && value.packetId > publications.Value())
+                        if (!pending.Remove(value.packetId) && !publications.Sent(value.packetId))
                             throw ProtocolError("Unknown publication acknowledgement", MMQP_REASON_INVALID_PID);
                         if (auto result = results.find(value.packetId); result != results.end())
                         {
@@ -450,13 +503,9 @@ namespace eMQ
                     }
                     else if constexpr (std::is_same_v<Type, ConnectionSync>)
                     {
-                        if (value.token)
-                        {
-                            if (options.authKey.empty()) throw ProtocolError("No reauthentication key", MMQP_REASON_AUTH_FAILED);
-                            auto response = Hmac256(options.authKey, *value.token);
-                            this->Write(ConnectionSync{Buffer(response.begin(), response.end())});
-                        }
-                        else this->Write(ConnectionSync{});
+                        // Tokens belong to the authentication challenge; active CONSYN is an empty keepalive.
+                        if (value.token) throw ProtocolError("Token-bearing CONSYN outside authentication");
+                        this->Write(ConnectionSync{});
                     }
                     else if constexpr (std::is_same_v<Type, ConnectionEnd>)
                     {
@@ -492,6 +541,9 @@ namespace eMQ
             {
                 try
                 {
+                    // The broker pings after one keepalive of client silence; allow one more for its arrival.
+                    if (now - std::max(lastReceive, lastSend) >= 2 * keepalive)
+                        throw ProtocolError("Broker silent for twice the keepalive interval", MMQP_REASON_KEEPALIVE_TIMEOUT);
                     if (!profileTasks.empty())
                     {
                         auto& task = profileTasks.front();
@@ -509,9 +561,8 @@ namespace eMQ
                         if (publication.retry > now) continue;
                         if (++publication.attempts > options.maxRetries)
                             throw ProtocolError("Publication retry budget exhausted", MMQP_REASON_TIMEOUT);
-                        auto retry = publication.message;
-                        retry.duplicate = true;
-                        if (!this->Write(retry)) throw ProtocolError("Publication retry send budget exhausted", MMQP_REASON_BUSY);
+                        publication.message.duplicate = true;
+                        if (!this->Write(publication.message)) throw ProtocolError("Publication retry send budget exhausted", MMQP_REASON_BUSY);
                         publication.retry = now + std::chrono::milliseconds(options.retryInterval);
                     }
                 }

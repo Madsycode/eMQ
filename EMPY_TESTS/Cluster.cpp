@@ -60,6 +60,16 @@ namespace
         EMPY_CHECK(tenant.Allows(fabric, "tenant/t"));
         EMPY_CHECK(!tenant.Allows(fabric, "tenant-other/t"));
         EMPY_CHECK(!tenant.Allows(fabric, "other/t"));
+        // A wildcard needs every shard it can match; an empty allowlist is unrestricted.
+        EMPY_CHECK(!tenant.Allows(fabric, "tenant/#") && !tenant.Allows(fabric, "tenant/+/temperature"));
+        std::set<uint32_t> all;
+        for (uint32_t shard = 0; shard < options.shards; ++shard) all.insert(shard);
+        TenantPolicy everywhere{"tenant", all};
+        EMPY_CHECK(everywhere.Allows(fabric, "tenant/#") && everywhere.Allows(fabric, "tenant/+/temperature"));
+        EMPY_CHECK(!everywhere.Allows(fabric, "other/#"));
+        TenantPolicy unrestricted{"tenant", {}};
+        EMPY_CHECK(unrestricted.Allows(fabric, "tenant/#") && unrestricted.Allows(fabric, "$bwm/tenant/device"));
+        EMPY_CHECK(!unrestricted.Allows(fabric, "other/#") && !unrestricted.Allows(fabric, "$bwm/other/device"));
     }
 
     void Forwarding()
@@ -87,10 +97,19 @@ namespace
         for (size_t rank = 1; rank < tree.brokers.size(); ++rank)
         {
             decoded.senderRank = static_cast<uint32_t>(*tree.Parent(rank));
-            FabricCodec::Validate(decoded, fabric, tree.brokers[decoded.senderRank], tree.brokers[rank], 1);
+            auto validated = FabricCodec::Validate(decoded, fabric, tree.brokers[decoded.senderRank], tree.brokers[rank], 1);
+            EMPY_CHECK(validated.brokers == tree.brokers);
             Throws([&] { FabricCodec::Validate(decoded, fabric, "unknown", tree.brokers[rank], 1); });
             Throws([&] { FabricCodec::Validate(decoded, fabric, tree.brokers[decoded.senderRank], tree.brokers[rank], 1000); });
         }
+        // Relays rewrite only the authenticated sender rank, byte-identical to a re-encoding.
+        auto relayed = FabricCodec::Encode(record, key);
+        auto parsed = FabricCodec::Decode(relayed, key);
+        FabricCodec::Rebind(relayed, parsed, 2, key);
+        auto ranked = record;
+        ranked.senderRank = 2;
+        EMPY_CHECK(relayed == FabricCodec::Encode(ranked, key) && FabricCodec::Decode(relayed, key).senderRank == 2);
+        Throws([&] { FabricCodec::Rebind(relayed, parsed, 1, key); });
         bytes[8] ^= 1;
         Throws([&] { FabricCodec::Decode(bytes, key); });
         auto wrongKey = key;

@@ -3,6 +3,7 @@
 #include <eMQ/Network/IOContext.h>
 #include <eMQ/Security/Crypto.h>
 #include <deque>
+#include <mutex>
 #include <map>
 #include <set>
 
@@ -47,9 +48,9 @@ namespace eMQ
             SessionProperties properties;
             ProfileTable profiles;
             ReceiveWindow received;
-            PacketSequence sequence;
+            PublicationSequence sequence;
             PendingQueue pending;
-            std::map<uint16_t, std::pair<Digest, Reason>> receipts;
+            std::map<uint64_t, std::pair<Digest, Reason>> receipts; // keyed by incoming 64-bit sequence
             std::map<uint16_t, std::pair<Digest, Reason>> profileReceipts;
             uint16_t lastProfile = 0;
             std::weak_ptr<Peer> peer;
@@ -64,6 +65,7 @@ namespace eMQ
             size_t replayBytes = 0;
             std::map<Digest, uint64_t> fabricReceipts;
             TimePoint nextInbox{};
+            uint32_t inboxInterval = 150;
             TimePoint nextCheckpoint{};
             CorrelationIds requestIds;
             PacketSequence responseIds;
@@ -100,6 +102,9 @@ namespace eMQ
         asio::steady_timer timer;
         eCore::Registry registry;
         std::map<std::string, eCore::Identt> sessions;
+        // Local subscription index: candidates are re-checked against the session profile.
+        TopicTree<eCore::Identt> routes;
+        std::map<eCore::Identt, std::vector<std::string>> indexed;
         std::map<uint64_t, std::shared_ptr<Peer>> peers;
         std::map<std::string, std::deque<Retained>> retained;
         std::map<std::pair<std::string, std::string>, size_t> sharedCursor;
@@ -115,11 +120,18 @@ namespace eMQ
         std::unique_ptr<ClusterNode> cluster;
         std::set<std::string> dirty;
         std::set<std::string> dirtyProfiles;
+        std::set<std::string> removed;
+        std::set<std::string> dirtyRetained;
+        std::vector<std::pair<std::string, TimePoint>> newTokens;
+        uint64_t generation = 0;
+        size_t baseBytes = 0;
         std::vector<std::function<void()>> effects;
         size_t effectBytes = 0;
         bool transaction = false;
         bool stateDirty = false;
         std::atomic<size_t> notificationBytes = 0;
+        std::mutex transientLock;
+        std::vector<std::pair<size_t, ClusterDelivery>> transients;
 
         Impl(Broker& service, BrokerOptions settings):
             owner(service), options(std::move(settings)), timer(io.Executor())
@@ -176,39 +188,17 @@ namespace eMQ
                     auto previous = notificationBytes.fetch_add(bytes);
                     if (previous >= options.maxSessionBytes || bytes > options.maxSessionBytes - previous)
                     { notificationBytes.fetch_sub(bytes); return; }
-                    io.Post([this, bytes, delivery = std::move(delivery)]
-                    {
-                        notificationBytes.fetch_sub(bytes);
-                        auto session = this->Find(delivery.session);
-                        if (!session || session->peer.expired() || !cluster->Owns(delivery.session)
-                            || delivery.expiry <= UnixMilliseconds() || stopping) return;
-                        transaction = true;
-                        try
-                        {
-                            this->AdmitTopic(delivery.publication.topic, false, session);
-                            bool response = delivery.publication.type == MMQP_PUBREQ_TYPE_RES;
-                            if ((response && this->AcceptResponse(*session, delivery.publication, delivery.sender))
-                                || (!response && !session->profiles.Subscriptions(delivery.publication.topic, 0,
-                                    delivery.publication.type == MMQP_PUBREQ_TYPE_REQ).empty()))
-                            {
-                                this->Deliver(this->Prepare(*session, delivery.publication, LoadExpiry(delivery.expiry), delivery.sender));
-                                if (response) this->CompleteResponse(*session, delivery.publication.correlationId, delivery.sender);
-                            }
-                            this->Finish();
-                        }
-                        catch (...)
-                        {
-                            transaction = false;
-                            effects.clear();
-                            effectBytes = 0;
-                        }
-                    });
+                    std::scoped_lock lock(transientLock);
+                    transients.emplace_back(bytes, std::move(delivery));
+                    // One drain task commits every queued transient delivery as a group.
+                    if (transients.size() == 1) io.Post([this] { this->DrainTransients(); });
                 };
             }
             else if (!options.stateDirectory.empty())
             {
                 storage = std::make_unique<FileStore>(options.stateDirectory, options.maxStateBytes);
-                if (auto saved = storage->Get("broker")) this->Restore(*saved);
+                if (auto saved = storage->Find("broker")) { baseBytes = saved->size(); this->Restore(*saved); }
+                for (const auto& entry : storage->Journal("broker")) this->ApplyJournal(entry);
             }
         }
 
@@ -221,7 +211,7 @@ namespace eMQ
         Buffer SaveSession(const Session& session)
         {
             Writer writer(options.maxStateBytes);
-            writer.U32(0x45535334);
+            writer.U32(0x45535335);
             writer.String(session.identifier);
             writer.String(session.realm);
             ConnectionRequest request;
@@ -233,7 +223,7 @@ namespace eMQ
             session.profiles.publishers.Save(writer);
             session.profiles.subscribers.Save(writer);
             session.received.Save(writer);
-            writer.U16(session.sequence.Value());
+            writer.U64(session.sequence.Issued());
             writer.U16(session.lastProfile);
             writer.U8(session.authenticated);
             writer.U8(session.resumable);
@@ -247,9 +237,11 @@ namespace eMQ
                 writer.U32(static_cast<uint32_t>(values.size()));
                 for (const auto& [id, value] : values)
                 {
-                    writer.U16(id);
+                    // Publication receipts store their 64-bit sequence; profile receipts their PID.
+                    if constexpr (sizeof(id) == sizeof(uint64_t)) writer.U64(id);
+                    else writer.U16(id);
                     writer.Bytes(value.first);
-                    WriteBuffer(writer, Codec::Encode(PublishAck{id, value.second}, {true, UINT32_MAX}));
+                    WriteBuffer(writer, Codec::Encode(PublishAck{WirePid(id), value.second}, {true, UINT32_MAX}));
                 }
             };
             receipts(session.receipts);
@@ -291,7 +283,10 @@ namespace eMQ
         Session LoadSession(std::span<const uint8_t> bytes)
         {
             Reader reader(bytes);
-            if (reader.U32() != 0x45535334) throw ProtocolError("Unknown session snapshot version; PRT-based request IDs require ESS4");
+            auto version = reader.U32();
+            if (version != 0x45535334 && version != 0x45535335)
+                throw ProtocolError("Unknown session snapshot version; PRT-based request IDs require ESS4 or ESS5");
+            bool legacy = version == 0x45535334; // ESS4: 16-bit publication sequences that never wrapped
             Session session;
             session.identifier = reader.String();
             session.realm = reader.String();
@@ -303,8 +298,8 @@ namespace eMQ
                 Codec::Decode(ReadBuffer(reader), {true, UINT32_MAX, static_cast<uint32_t>(options.maxProfiles)})).entries;
             session.profiles.publishers = AliasMap::Load(reader);
             session.profiles.subscribers = AliasMap::Load(reader);
-            session.received = ReceiveWindow::Load(reader);
-            session.sequence = PacketSequence(reader.U16());
+            session.received = ReceiveWindow::Load(reader, legacy);
+            session.sequence = PublicationSequence(legacy ? reader.U16() : reader.U64());
             session.lastProfile = reader.U16();
             session.authenticated = reader.U8() != 0;
             session.resumable = reader.U8() != 0;
@@ -316,12 +311,13 @@ namespace eMQ
                 if (count > options.maxInflight) throw ProtocolError("Stored receipt budget exceeded");
                 for (uint32_t i = 0; i < count; ++i)
                 {
-                    auto id = reader.U16();
+                    using Key = typename std::decay_t<decltype(values)>::key_type;
+                    Key id = sizeof(Key) == sizeof(uint64_t) && !legacy ? static_cast<Key>(reader.U64()) : static_cast<Key>(reader.U16());
                     Digest digest{};
                     auto bytes = reader.Bytes(digest.size());
                     std::copy(bytes.begin(), bytes.end(), digest.begin());
                     auto ack = std::get<PublishAck>(Codec::Decode(ReadBuffer(reader), {true, UINT32_MAX}));
-                    if (ack.packetId != id || !values.emplace(id, std::make_pair(digest, ack.reason)).second)
+                    if (ack.packetId != WirePid(id) || !values.emplace(id, std::make_pair(digest, ack.reason)).second)
                         throw ProtocolError("Invalid stored receipt");
                 }
             };
@@ -335,12 +331,13 @@ namespace eMQ
             {
                 auto expiry = LoadExpiry(reader.U64());
                 auto message = std::get<PublishRequest>(Codec::Decode(ReadBuffer(reader), {true, UINT32_MAX}));
-                if (message.packetId > session.sequence.Value()) throw ProtocolError("Stored outgoing PID exceeds sequence");
+                if (!session.sequence.Sent(message.packetId)) throw ProtocolError("Stored outgoing PID exceeds sequence");
                 if (expiry <= Clock::now() && session.properties.quic) session.resumable = false;
                 if (expiry > Clock::now())
                 {
                     auto size = Codec::Encode(message, {session.properties.policy->reasons, UINT32_MAX}).size();
-                    session.pending.Add(std::move(message), size, Clock::now(), expiry);
+                    auto sequence = session.sequence.Sequence(message.packetId);
+                    session.pending.Add(std::move(message), sequence, size, Clock::now(), expiry);
                 }
             }
             count = reader.U32();
@@ -425,64 +422,104 @@ namespace eMQ
             return session;
         }
 
+        // Standalone persistence: an EBR5 base snapshot plus an EBJ1 journal of the
+        // sessions, retained topics and tokens changed by each commit. The base
+        // carries a generation; journal entries from an older base are ignored.
+        void SaveRetained(Writer& writer, const std::string& topic) const
+        {
+            writer.String(topic);
+            auto found = retained.find(topic);
+            writer.U32(found == retained.end() ? 0 : static_cast<uint32_t>(found->second.size()));
+            if (found == retained.end()) return;
+            for (const auto& record : found->second)
+            {
+                writer.U64(SaveExpiry(record.expiry));
+                WriteBuffer(writer, Codec::Encode(record.message, {true, UINT32_MAX}));
+            }
+        }
+
+        void LoadRetained(Reader& reader)
+        {
+            auto topic = reader.String();
+            auto size = reader.U32();
+            if (size > 255) throw ProtocolError("Stored retention queue exceeds profile limit");
+            if (auto previous = retained.find(topic); previous != retained.end())
+            {
+                for (const auto& record : previous->second) metrics.retainedBytes -= record.bytes;
+                retained.erase(previous);
+            }
+            for (uint32_t j = 0; j < size; ++j)
+            {
+                auto expiry = LoadExpiry(reader.U64());
+                auto record = ReadBuffer(reader);
+                auto publication = std::get<PublishRequest>(Codec::Decode(record, {true, UINT32_MAX}));
+                if (publication.topic != topic) throw ProtocolError("Stored retained topic mismatch");
+                if (expiry <= Clock::now()) continue;
+                auto bytes = Codec::Encode(publication, {false, UINT32_MAX}).size();
+                metrics.retainedBytes += bytes;
+                if (metrics.retainedBytes > options.maxRetainedBytes) throw ProtocolError("Stored retention exceeds budget");
+                retained[topic].push_back({std::move(publication), expiry, bytes});
+            }
+            if (retained.size() > options.maxRetainedTopics) throw ProtocolError("Stored topics exceed configured budget");
+        }
+
+        void LoadSessionRecord(std::span<const uint8_t> bytes)
+        {
+            auto session = this->LoadSession(bytes);
+            auto found = sessions.find(session.identifier);
+            if (session.expiry <= Clock::now())
+            {
+                if (found != sessions.end()) this->Destroy(found);
+                return;
+            }
+            if (found != sessions.end())
+            {
+                auto& existing = registry.get<Session>(found->second);
+                existing = std::move(session);
+                this->Index(existing);
+                return;
+            }
+            if (sessions.size() >= options.maxSessions) throw ProtocolError("Stored sessions exceed configured budget");
+            auto entity = registry.create();
+            sessions.emplace(session.identifier, entity);
+            this->Index(registry.emplace<Session>(entity, std::move(session)));
+        }
+
         Buffer Snapshot()
         {
             Writer writer(options.maxStateBytes);
-            writer.U32(0x45425234);
+            writer.U32(0x45425235);
+            writer.U64(generation);
             writer.U32(static_cast<uint32_t>(sessions.size()));
             for (const auto& [id, entity] : sessions) WriteBuffer(writer, this->SaveSession(registry.get<Session>(entity)));
             writer.U32(static_cast<uint32_t>(retained.size()));
-            for (const auto& [topic, records] : retained)
-            {
-                writer.String(topic);
-                writer.U32(static_cast<uint32_t>(records.size()));
-                for (const auto& record : records)
-                {
-                    writer.U64(SaveExpiry(record.expiry));
-                    WriteBuffer(writer, Codec::Encode(record.message, {true, UINT32_MAX}));
-                }
-            }
+            for (const auto& [topic, records] : retained) this->SaveRetained(writer, topic);
             writer.U32(static_cast<uint32_t>(authTokens.size()));
             for (const auto& [token, expiry] : authTokens) { writer.String(token); writer.U64(SaveExpiry(expiry)); }
             return writer.Take();
         }
 
-        void Restore(const Buffer& bytes)
+        void Restore(std::span<const uint8_t> bytes)
         {
             Reader reader(bytes);
-            if (reader.U32() != 0x45425234) throw ProtocolError("Unknown broker snapshot version; PRT-based request IDs require EBR4");
+            auto version = reader.U32();
+            // EBR4 is the previous single-record layout; it is read as generation zero.
+            if (version != 0x45425234 && version != 0x45425235)
+                throw ProtocolError("Unknown broker snapshot version; PRT-based request IDs require EBR4 or EBR5");
+            generation = version == 0x45425235 ? reader.U64() : 0;
             auto count = reader.U32();
             if (count > options.maxSessions) throw ProtocolError("Stored sessions exceed configured budget");
             for (uint32_t i = 0; i < count; ++i)
             {
-                auto session = this->LoadSession(ReadBuffer(reader));
-                if (session.expiry <= Clock::now()) continue;
-                auto entity = registry.create();
-                if (!sessions.emplace(session.identifier, entity).second) throw ProtocolError("Duplicate stored session");
-                registry.emplace<Session>(entity, std::move(session));
+                auto record = ReadBuffer(reader);
+                Reader identity(record);
+                identity.U32();
+                if (sessions.contains(identity.String())) throw ProtocolError("Duplicate stored session");
+                this->LoadSessionRecord(record);
             }
             count = reader.U32();
             if (count > options.maxRetainedTopics) throw ProtocolError("Stored topics exceed configured budget");
-            for (uint32_t i = 0; i < count; ++i)
-            {
-                auto topic = reader.String();
-                auto size = reader.U32();
-                if (size > 255) throw ProtocolError("Stored retention queue exceeds profile limit");
-                for (uint32_t j = 0; j < size; ++j)
-                {
-                    auto expiry = LoadExpiry(reader.U64());
-                    auto record = ReadBuffer(reader);
-                    auto publication = std::get<PublishRequest>(Codec::Decode(record, {true, UINT32_MAX}));
-                    if (publication.topic != topic) throw ProtocolError("Stored retained topic mismatch");
-                    if (expiry > Clock::now())
-                    {
-                        auto bytes = Codec::Encode(publication, {false, UINT32_MAX}).size();
-                        metrics.retainedBytes += bytes;
-                        if (metrics.retainedBytes > options.maxRetainedBytes) throw ProtocolError("Stored retention exceeds budget");
-                        retained[topic].push_back({std::move(publication), expiry, bytes});
-                    }
-                }
-            }
+            for (uint32_t i = 0; i < count; ++i) this->LoadRetained(reader);
             if (this->RequestCount() > options.maxRequests) throw ProtocolError("Stored request budget exceeded");
             count = reader.U32();
             if (count > 4096) throw ProtocolError("Stored authentication budget exceeded");
@@ -495,8 +532,89 @@ namespace eMQ
             reader.Finish();
         }
 
+        void ApplyJournal(std::span<const uint8_t> bytes)
+        {
+            Reader reader(bytes);
+            if (reader.U32() != 0x45424A31) throw ProtocolError("Unknown broker journal version");
+            if (reader.U64() != generation) return;
+            for (auto count = reader.U32(); count; --count) this->LoadSessionRecord(ReadBuffer(reader));
+            for (auto count = reader.U32(); count; --count)
+                if (auto found = sessions.find(reader.String()); found != sessions.end()) this->Destroy(found);
+            for (auto count = reader.U32(); count; --count) this->LoadRetained(reader);
+            for (auto count = reader.U32(); count; --count)
+            {
+                auto token = reader.String();
+                auto expiry = LoadExpiry(reader.U64());
+                if (expiry > Clock::now() && authTokens.size() < 4096) authTokens.emplace(std::move(token), expiry);
+            }
+            reader.Finish();
+            if (this->RequestCount() > options.maxRequests) throw ProtocolError("Stored request budget exceeded");
+        }
+
+        void Persist()
+        {
+            if (storage->JournalBytes("broker") >= std::max<size_t>(1024 * 1024, baseBytes))
+            {
+                // Compaction: the new base supersedes every journal entry before it.
+                ++generation;
+                auto base = this->Snapshot();
+                baseBytes = base.size();
+                storage->Put("broker", std::move(base));
+                storage->Reset("broker");
+                return;
+            }
+            Writer writer(options.maxStateBytes);
+            writer.U32(0x45424A31);
+            writer.U64(generation);
+            std::vector<const Session*> changed;
+            for (const auto& id : dirty) if (auto session = this->Find(id)) changed.push_back(session);
+            writer.U32(static_cast<uint32_t>(changed.size()));
+            for (auto session : changed) WriteBuffer(writer, this->SaveSession(*session));
+            writer.U32(static_cast<uint32_t>(removed.size()));
+            for (const auto& id : removed) writer.String(id);
+            writer.U32(static_cast<uint32_t>(dirtyRetained.size()));
+            for (const auto& topic : dirtyRetained) this->SaveRetained(writer, topic);
+            writer.U32(static_cast<uint32_t>(newTokens.size()));
+            for (const auto& [token, expiry] : newTokens) { writer.String(token); writer.U64(SaveExpiry(expiry)); }
+            if (changed.empty() && removed.empty() && dirtyRetained.empty() && newTokens.empty()) return;
+            storage->Append("broker", writer.Data());
+        }
+
+        void Unindex(eCore::Identt entity)
+        {
+            auto found = indexed.find(entity);
+            if (found == indexed.end()) return;
+            for (const auto& filter : found->second) routes.Remove(filter, entity);
+            indexed.erase(found);
+        }
+
+        void Index(const Session& session)
+        {
+            auto found = sessions.find(session.identifier);
+            if (found == sessions.end()) return;
+            this->Unindex(found->second);
+            std::vector<std::string> filters;
+            for (const auto& entry : session.profiles.entries)
+            {
+                if (entry.type != MMQP_PROREQ_TYPE_SUB) continue;
+                auto filter = std::string(SplitShared(entry.topic).second);
+                if (std::find(filters.begin(), filters.end(), filter) != filters.end()) continue;
+                routes.Insert(filter, found->second);
+                filters.push_back(std::move(filter));
+            }
+            if (!filters.empty()) indexed.emplace(found->second, std::move(filters));
+        }
+
+        void Destroy(std::map<std::string, eCore::Identt>::iterator session)
+        {
+            this->Unindex(session->second);
+            registry.destroy(session->second);
+            sessions.erase(session);
+        }
+
         void Changed(Session& session, bool profile = false)
         {
+            if (profile) this->Index(session);
             dirty.insert(session.identifier);
             if (profile) dirtyProfiles.insert(session.identifier);
             stateDirty = true;
@@ -505,7 +623,7 @@ namespace eMQ
         void Checkpoint()
         {
             if (!stateDirty) return;
-            if (storage) storage->Put("broker", this->Snapshot());
+            if (storage) this->Persist();
             if (cluster)
             {
                 for (const auto& id : dirty)
@@ -529,6 +647,9 @@ namespace eMQ
             }
             dirty.clear();
             dirtyProfiles.clear();
+            removed.clear();
+            dirtyRetained.clear();
+            newTokens.clear();
             stateDirty = false;
         }
 
@@ -574,6 +695,43 @@ namespace eMQ
         {
             if (transaction) effects.push_back([peer, drain] { peer->connection->Close(drain); });
             else peer->connection->Close(drain);
+        }
+
+        void DrainTransients()
+        {
+            std::vector<std::pair<size_t, ClusterDelivery>> batch;
+            {
+                std::scoped_lock lock(transientLock);
+                batch.swap(transients);
+            }
+            transaction = true;
+            for (auto& [bytes, delivery] : batch)
+            {
+                notificationBytes.fetch_sub(bytes);
+                auto session = this->Find(delivery.session);
+                if (!session || session->peer.expired() || !cluster->Owns(delivery.session)
+                    || delivery.expiry <= UnixMilliseconds() || stopping) continue;
+                try
+                {
+                    this->AdmitTopic(delivery.publication.topic, false, session);
+                    bool response = delivery.publication.type == MMQP_PUBREQ_TYPE_RES;
+                    if ((response && this->AcceptResponse(*session, delivery.publication, delivery.sender))
+                        || (!response && session->profiles.Subscribed(delivery.publication.topic, 0,
+                            delivery.publication.type == MMQP_PUBREQ_TYPE_REQ)))
+                    {
+                        this->Deliver(this->Prepare(*session, delivery.publication, LoadExpiry(delivery.expiry), delivery.sender));
+                        if (response) this->CompleteResponse(*session, delivery.publication.correlationId, delivery.sender);
+                    }
+                }
+                catch (const ProtocolError&) {} // Transient traffic is best effort; one rejection must not drop the batch.
+            }
+            try { this->Finish(); }
+            catch (...)
+            {
+                transaction = false;
+                effects.clear();
+                effectBytes = 0;
+            }
         }
 
         Session* Find(const std::string& identifier)
@@ -663,6 +821,7 @@ namespace eMQ
             peer->deadline = Clock::now() + std::chrono::milliseconds(options.transport.timeout);
             peers.emplace(peer->id, peer);
             peer->connection->onReceive = [this, id = peer->id] (auto bytes) { this->Receive(id, bytes); };
+            peer->connection->onFlush = [this, id = peer->id] { this->Flush(id); };
             peer->connection->onClose = [this, id = peer->id] (const auto& reason) { this->Closed(id, reason); };
         }
 
@@ -681,13 +840,13 @@ namespace eMQ
                 if (snapshot.empty()) { cluster->Release(identifier); throw ProtocolError("Unknown replicated session", MMQP_REASON_SESSION_EXPIRED); }
                 auto restored = this->LoadSession(snapshot);
                 if (restored.identifier != identifier) throw ProtocolError("Snapshot identity differs from requested SID");
-                if (existing) *existing = std::move(restored);
+                if (existing) { *existing = std::move(restored); this->Index(*existing); }
                 else
                 {
                     if (sessions.size() >= options.maxSessions) throw ProtocolError("Session budget exhausted", MMQP_REASON_BUSY);
                     auto entity = registry.create();
                     sessions.emplace(identifier, entity);
-                    registry.emplace<Session>(entity, std::move(restored));
+                    this->Index(registry.emplace<Session>(entity, std::move(restored)));
                 }
             }
             if (request.resume)
@@ -800,9 +959,8 @@ namespace eMQ
                 if (created)
                 {
                     auto identifier = session->identifier;
-                    auto entity = sessions.at(identifier);
-                    sessions.erase(identifier);
-                    registry.destroy(entity);
+                    this->Destroy(sessions.find(identifier));
+                    removed.insert(identifier);
                     if (cluster) cluster->Release(identifier);
                 }
                 throw;
@@ -829,7 +987,9 @@ namespace eMQ
                 auto token = ToHex(auth->token);
                 if (authTokens.contains(token) || authTokens.size() >= 4096)
                     throw ProtocolError("Repeated token or authentication budget exhausted", MMQP_REASON_AUTH_FAILED);
-                authTokens.emplace(token, Clock::now() + std::chrono::hours(1));
+                auto expiry = Clock::now() + std::chrono::hours(1);
+                authTokens.emplace(token, expiry);
+                newTokens.emplace_back(token, expiry);
                 stateDirty = true;
                 if (cluster)
                 {
@@ -862,27 +1022,37 @@ namespace eMQ
 
         std::vector<Session*> Destinations(const PublishRequest& publication, bool responders)
         {
-            std::map<std::string, Session*> selected;
-            std::map<std::pair<std::string, std::string>, std::vector<Session*>> shared;
-            for (auto& [identifier, entity] : sessions)
+            std::vector<eCore::Identt> candidates;
+            routes.Match(publication.topic, [&] (eCore::Identt entity) { candidates.push_back(entity); });
+            std::sort(candidates.begin(), candidates.end());
+            candidates.erase(std::unique(candidates.begin(), candidates.end()), candidates.end());
+            auto now = Clock::now();
+            std::vector<Session*> result;
+            std::map<std::pair<std::string_view, std::string_view>, std::vector<Session*>> shared;
+            for (auto entity : candidates)
             {
-                auto& session = registry.get<Session>(entity);
-                if ((session.peer.expired() && (!publication.qos || responders)) || session.expiry <= Clock::now()) continue;
-                for (const auto& entry : session.profiles.Subscriptions(publication.topic, publication.qos, responders))
+                auto* session = registry.try_get<Session>(entity);
+                if (!session || (session->peer.expired() && (!publication.qos || responders)) || session->expiry <= now) continue;
+                bool direct = false;
+                session->profiles.ForEachSubscription(publication.topic, publication.qos, responders, [&] (const ProfileEntry& entry)
                 {
-                    auto pattern = ParseTopic(entry.topic, true);
-                    if (pattern.group.empty()) selected.emplace(identifier, &session);
-                    else if (!session.peer.expired()) shared[{pattern.group, pattern.filter}].push_back(&session);
-                }
+                    auto [group, filter] = SplitShared(entry.topic);
+                    if (group.empty()) direct = true;
+                    else if (!session->peer.expired()) shared[{group, filter}].push_back(session);
+                });
+                if (direct) result.push_back(session);
             }
+            auto order = [] (const Session* left, const Session* right) { return left->identifier < right->identifier; };
             for (auto& [group, members] : shared)
             {
-                auto& cursor = sharedCursor[group];
-                auto selectedMember = members[cursor++ % members.size()];
-                selected.emplace(selectedMember->identifier, selectedMember);
+                // SID order keeps the round-robin rotation stable between lookups.
+                std::sort(members.begin(), members.end(), order);
+                auto& cursor = sharedCursor[{std::string(group.first), std::string(group.second)}];
+                result.push_back(members[cursor++ % members.size()]);
             }
-            std::vector<Session*> result;
-            for (auto& [identifier, session] : selected) result.push_back(session);
+            // Overlapping subscriptions are delivered once per recipient session.
+            std::sort(result.begin(), result.end(), order);
+            result.erase(std::unique(result.begin(), result.end()), result.end());
             return result;
         }
 
@@ -894,8 +1064,8 @@ namespace eMQ
                 for (const auto& profile : registry.get<Session>(entity).profiles.entries)
                 {
                     if (profile.type != MMQP_PROREQ_TYPE_SUB) continue;
-                    auto pattern = ParseTopic(profile.topic, true);
-                    if (!pattern.group.empty()) groups.emplace(pattern.group, pattern.filter);
+                    auto [group, filter] = SplitShared(profile.topic);
+                    if (!group.empty()) groups.emplace(group, filter);
                 }
             }
             std::erase_if(sharedCursor, [&] (const auto& cursor) { return !groups.contains(cursor.first); });
@@ -908,7 +1078,14 @@ namespace eMQ
 
         Dispatch Prepare(Session& session, const PublishRequest& source, TimePoint expiry, std::string_view sender = {})
         {
-            auto message = source;
+            // QoS 0 deliveries are encoded from the source payload; only QoS 1 keeps a copy for retries.
+            PublishRequest message;
+            message.type = source.type;
+            message.qos = source.qos;
+            message.correlationId = source.correlationId;
+            message.responses = source.responses;
+            message.reason = source.reason;
+            message.encryption = source.encryption;
             std::optional<ResponseRoute> response;
             if (message.type == MMQP_PUBREQ_TYPE_REQ)
             {
@@ -931,8 +1108,9 @@ namespace eMQ
             CodecOptions codec;
             codec.reasons = session.properties.policy->reasons;
             codec.maxPacket = *session.properties.policy->maxPacket;
-            auto bytes = Codec::Encode(message, codec);
-            if ((message.qos && !session.pending.CanAdd(bytes.size(), message.packetId))
+            auto bytes = Codec::Encode(message, codec, source.payload);
+            if (message.qos) message.payload = source.payload;
+            if ((message.qos && !session.pending.CanAdd(bytes.size(), session.sequence.Issued() + 1))
                 || (peer && bytes.size() > peer->connection->Capacity() - peer->connection->Queued()))
                 throw ProtocolError("Subscriber send budget exhausted", MMQP_REASON_BUSY);
             return {&session, std::move(message), std::move(bytes), expiry, source.topic, std::move(response)};
@@ -951,7 +1129,7 @@ namespace eMQ
             if (dispatch.message.qos)
             {
                 if (session.sequence.Next() != dispatch.message.packetId) throw std::logic_error("Publication admission order changed");
-                session.pending.Add(dispatch.message, dispatch.bytes.size(),
+                session.pending.Add(dispatch.message, session.sequence.Issued(), dispatch.bytes.size(),
                     Clock::now() + std::chrono::milliseconds(options.retryInterval), dispatch.expiry);
             }
             this->Changed(session);
@@ -980,24 +1158,48 @@ namespace eMQ
 
         void Retain(const PublishRequest& publication, const ProfileEntry& profile)
         {
+            // Updates the topic queue in place: no copy of retained payloads and no
+            // global expiry sweep unless a budget would otherwise reject the record.
             stateDirty = true;
-            this->PurgeRetained(Clock::now());
-            auto previous = retained.find(publication.topic);
-            if (previous == retained.end() && retained.size() >= options.maxRetainedTopics)
-                throw ProtocolError("Retained topic budget exhausted", MMQP_REASON_BUSY);
-            auto queue = previous == retained.end() ? std::deque<Retained>{} : previous->second;
-            size_t oldBytes = 0;
-            for (const auto& record : queue) oldBytes += record.bytes;
-            auto limit = profile.qos ? profile.queue : 1;
-            while (queue.size() >= static_cast<size_t>(limit)) queue.pop_front();
+            auto now = Clock::now();
+            auto found = retained.find(publication.topic);
+            if (found == retained.end() && retained.size() >= options.maxRetainedTopics)
+            {
+                this->PurgeRetained(now);
+                if (retained.size() >= options.maxRetainedTopics)
+                    throw ProtocolError("Retained topic budget exhausted", MMQP_REASON_BUSY);
+            }
+            auto limit = static_cast<size_t>(profile.qos ? profile.queue : 1);
             auto bytes = Codec::Encode(publication, {false, options.transport.maxPacket}).size();
-            queue.push_back({publication, Clock::now() + std::chrono::seconds(DecodeInterval(profile.expiry)), bytes});
-            size_t newBytes = 0;
-            for (const auto& record : queue) newBytes += record.bytes;
-            if (newBytes > options.maxRetainedBytes - (metrics.retainedBytes - oldBytes))
-                throw ProtocolError("Retained payload budget exhausted", MMQP_REASON_BUSY);
-            retained[publication.topic] = std::move(queue);
-            metrics.retainedBytes = metrics.retainedBytes - oldBytes + newBytes;
+            auto evicted = [&]
+            {
+                if (found == retained.end()) return std::pair<size_t, size_t>{0, 0};
+                auto& queue = found->second;
+                std::erase_if(queue, [&] (const Retained& value)
+                {
+                    if (value.expiry > now) return false;
+                    metrics.retainedBytes -= value.bytes;
+                    return true;
+                });
+                size_t count = queue.size() >= limit ? queue.size() - limit + 1 : 0;
+                size_t freed = 0;
+                for (size_t i = 0; i < count; ++i) freed += queue[i].bytes;
+                return std::pair{count, freed};
+            };
+            auto [count, freed] = evicted();
+            if (bytes > options.maxRetainedBytes - (metrics.retainedBytes - freed))
+            {
+                this->PurgeRetained(now);
+                found = retained.find(publication.topic);
+                std::tie(count, freed) = evicted();
+                if (bytes > options.maxRetainedBytes - (metrics.retainedBytes - freed))
+                    throw ProtocolError("Retained payload budget exhausted", MMQP_REASON_BUSY);
+            }
+            auto& queue = found == retained.end() ? retained[publication.topic] : found->second;
+            queue.erase(queue.begin(), queue.begin() + static_cast<std::ptrdiff_t>(count));
+            queue.push_back({publication, now + std::chrono::seconds(DecodeInterval(profile.expiry)), bytes});
+            metrics.retainedBytes = metrics.retainedBytes - freed + bytes;
+            dirtyRetained.insert(publication.topic);
         }
 
         void Replay(Session& session, const ProfileRequest& profile)
@@ -1010,9 +1212,9 @@ namespace eMQ
                 bool match = false;
                 for (const auto& entry : profile.entries)
                 {
-                    auto filter = entry.topic.empty() ? session.profiles.subscribers.Resolve(entry.alias) : entry.topic;
-                    if (entry.type == MMQP_PROREQ_TYPE_SUB && entry.qos && !entry.request && TopicMatches(filter, topic))
-                        match = true;
+                    if (entry.type != MMQP_PROREQ_TYPE_SUB || !entry.qos || entry.request) continue;
+                    const auto& filter = entry.topic.empty() ? session.profiles.subscribers.Resolve(entry.alias) : entry.topic;
+                    if (MatchTopic(CanonicalTopic(filter), topic)) { match = true; break; }
                 }
                 if (!match) continue;
                 for (const auto& record : queue)
@@ -1187,13 +1389,14 @@ namespace eMQ
                     // Repeat the original inbox writes with the same identity.
                     // Current SID owners discover them through quorum polling;
                     // stale broker locations need not be restored or guessed.
-                    cluster->Publish(session.identifier, message.packetId, publication, targets, SaveExpiry(expiry));
+                    cluster->Publish(session.identifier, session.received.Sequence(message.packetId), publication, targets, SaveExpiry(expiry));
                 }
                 auto canonical = message;
                 canonical.alias = 1;
                 canonical.duplicate = false;
+                auto sequence = session.received.Sequence(message.packetId);
                 session.received.Commit(message.packetId);
-                session.receipts[message.packetId] = {Sha256(Codec::Encode(canonical, {true, UINT32_MAX})), reason};
+                session.receipts[sequence] = {Sha256(Codec::Encode(canonical, {true, UINT32_MAX})), reason};
                 while (session.receipts.size() > options.maxInflight) session.receipts.erase(session.receipts.begin());
                 if (message.type == MMQP_PUBREQ_TYPE_RES) session.responseRoutes.erase(message.correlationId);
                 it = session.rpcAdmissions.erase(it);
@@ -1205,7 +1408,7 @@ namespace eMQ
             const ResponseRoute* response, uint16_t correlationId)
         {
             auto sender = publisher ? publisher->identifier : "status:" + cluster->Identifier();
-            uint64_t sequence = publication.packetId;
+            uint64_t sequence = publisher && publication.qos ? publisher->received.Sequence(publication.packetId) : 0;
             if (!publisher)
             {
                 auto random = RandomBytes(8);
@@ -1239,9 +1442,9 @@ namespace eMQ
                 std::map<std::pair<std::string, std::string>, std::vector<ClusterProfile>> groups;
                 for (const auto& candidate : candidates)
                 {
-                    auto pattern = ParseTopic(candidate.profile.topic, true);
-                    if (pattern.group.empty()) selected.emplace(candidate.session, candidate);
-                    else if (candidate.online) groups[{pattern.group, pattern.filter}].push_back(candidate);
+                    auto [group, filter] = SplitShared(candidate.profile.topic);
+                    if (group.empty()) selected.emplace(candidate.session, candidate);
+                    else if (candidate.online) groups[{std::string(group), std::string(filter)}].push_back(candidate);
                 }
                 for (auto& [group, members] : groups)
                 {
@@ -1307,8 +1510,12 @@ namespace eMQ
         void DrainInbox(Session& session)
         {
             if (!cluster || session.peer.expired() || session.nextInbox > Clock::now() || !cluster->Owns(session.identifier)) return;
-            session.nextInbox = Clock::now() + std::chrono::milliseconds(150);
             auto records = cluster->Inbox(session.identifier);
+            // Notifications wake the drain immediately; polling only recovers lost notifications,
+            // so an empty inbox backs off from 150 ms to 2 s.
+            session.inboxInterval = records.empty() ? std::min<uint32_t>(2000, std::max<uint32_t>(150, session.inboxInterval * 2)) : 150;
+            session.nextInbox = Clock::now() + std::chrono::milliseconds(session.inboxInterval);
+            std::vector<ClusterDelivery> consumed;
             std::erase_if(session.fabricReceipts, [] (const auto& entry) { return entry.second <= UnixMilliseconds(); });
             for (const auto& record : records)
             {
@@ -1318,7 +1525,7 @@ namespace eMQ
                     const auto& message = record.publication;
                     this->AdmitTopic(message.topic, false, &session);
                     bool allowed = message.type == MMQP_PUBREQ_TYPE_RES ? this->AcceptResponse(session, message, record.sender)
-                        : !session.profiles.Subscriptions(message.topic, message.qos, message.type == MMQP_PUBREQ_TYPE_REQ).empty();
+                        : session.profiles.Subscribed(message.topic, message.qos, message.type == MMQP_PUBREQ_TYPE_REQ);
                     if (allowed)
                     {
                         try { this->Deliver(this->Prepare(session, message, LoadExpiry(record.expiry), record.sender)); }
@@ -1328,9 +1535,10 @@ namespace eMQ
                     session.fabricReceipts[record.identity] = record.expiry;
                     this->Changed(session);
                 }
-                effects.push_back([this, record]
-                { try { cluster->Acknowledge(record); } catch (const ProtocolError&) {} });
+                consumed.push_back(record);
             }
+            if (!consumed.empty())
+                effects.push_back([this, consumed = std::move(consumed)] { cluster->Acknowledge(consumed); });
         }
 
         Reason Route(Session* publisher, PublishRequest publication, std::optional<ProfileEntry> registration = {})
@@ -1446,11 +1654,12 @@ namespace eMQ
                 canonical.duplicate = false;
                 digest = Sha256(Codec::Encode(canonical, {true, UINT32_MAX}));
             }
-            if (publication.qos && session.received.Inspect(publication.packetId) == Reception::OutsideWindow)
+            auto state = publication.qos ? session.received.Inspect(publication.packetId) : Reception::New;
+            if (state == Reception::OutsideWindow)
                 throw ProtocolError("Publication exceeds the receive window", MMQP_REASON_INVALID_PID);
-            if (publication.qos && session.received.Inspect(publication.packetId) == Reception::Duplicate)
+            if (state == Reception::Duplicate)
             {
-                auto found = session.receipts.find(publication.packetId);
+                auto found = session.receipts.find(session.received.Sequence(publication.packetId));
                 if (found == session.receipts.end())
                     throw ProtocolError("PID is older than the receipt window", MMQP_REASON_INVALID_PID);
                 if (!SecureEqual(found->second.first, digest))
@@ -1489,8 +1698,9 @@ namespace eMQ
             if (qos)
             {
                 session.rpcAdmissions.erase(packetId);
+                auto sequence = session.received.Sequence(packetId);
                 session.received.Commit(packetId);
-                session.receipts[packetId] = std::make_pair(digest, reason);
+                session.receipts[sequence] = std::make_pair(digest, reason);
                 while (session.receipts.size() > options.maxInflight) session.receipts.erase(session.receipts.begin());
                 this->Send(peer, PublishAck{packetId, reason});
             }
@@ -1524,22 +1734,29 @@ namespace eMQ
             if (reason.code < 0x80) this->Replay(session, request);
         }
 
+        // Frames from one transport read form one transaction. Their single checkpoint
+        // (group commit) precedes every acknowledgement and delivery they produced.
         void Receive(uint64_t id, std::span<const uint8_t> bytes)
         {
             transaction = true;
-            try
-            {
-                this->ReceivePacket(id, bytes);
-                this->Finish();
-            }
-            catch (const std::exception& error)
-            {
-                transaction = false;
-                effects.clear();
-                effectBytes = 0;
-                EMPY_ERROR("Broker checkpoint failed: {}", error.what());
-                if (auto peer = peers.find(id); peer != peers.end()) this->Fail(peer->second, {MMQP_REASON_BUSY, "Durable majority unavailable"});
-            }
+            try { this->ReceivePacket(id, bytes); }
+            catch (const std::exception& error) { this->Abort(id, error); }
+        }
+
+        void Flush(uint64_t id)
+        {
+            if (!transaction) return;
+            try { this->Finish(); }
+            catch (const std::exception& error) { this->Abort(id, error); }
+        }
+
+        void Abort(uint64_t id, [[maybe_unused]] const std::exception& error)
+        {
+            transaction = false;
+            effects.clear();
+            effectBytes = 0;
+            EMPY_ERROR("Broker checkpoint failed: {}", error.what());
+            if (auto peer = peers.find(id); peer != peers.end()) this->Fail(peer->second, {MMQP_REASON_BUSY, "Durable majority unavailable"});
         }
 
         void ReceivePacket(uint64_t id, std::span<const uint8_t> bytes)
@@ -1592,7 +1809,7 @@ namespace eMQ
                     }
                     else if constexpr (std::is_same_v<Type, PublishAck>)
                     {
-                        if (!session->pending.Remove(value.packetId) && value.packetId > session->sequence.Value())
+                        if (!session->pending.Remove(value.packetId) && !session->sequence.Sent(value.packetId))
                             throw ProtocolError("Acknowledgement references an unsent PID", MMQP_REASON_INVALID_PID);
                         this->DrainReplay(*session);
                     }
@@ -1694,8 +1911,8 @@ namespace eMQ
                         request.responders.clear();
                         this->UpdateRequest(request);
                     }
-                    registry.destroy(it->second);
-                    it = sessions.erase(it);
+                    removed.insert(it->first);
+                    this->Destroy(it++);
                     this->PruneShared();
                     stateDirty = true;
                     continue;

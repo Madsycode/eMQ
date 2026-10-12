@@ -3,6 +3,33 @@
 
 using namespace eMQ;
 
+namespace
+{
+    // The previous allocating matcher, kept as an independent reference.
+    bool ReferenceMatch(const std::string& pattern, const std::string& name)
+    {
+        if (name.front() == '$' && pattern.front() != '$') return false;
+        size_t left = 0;
+        size_t right = 0;
+        while (left < pattern.size())
+        {
+            auto stop = pattern.find('/', left);
+            if (stop == std::string::npos) stop = pattern.size();
+            auto level = std::string_view(pattern).substr(left, stop - left);
+            if (level == "#") return true;
+            if (right >= name.size()) return false;
+            auto next = name.find('/', right);
+            if (next == std::string::npos) next = name.size();
+            if (level != "+" && level != std::string_view(name).substr(right, next - right)) return false;
+            left = stop + 1;
+            right = next + 1;
+            if (next == name.size())
+                return stop == pattern.size() || std::string_view(pattern).substr(left) == "#";
+        }
+        return right > name.size();
+    }
+}
+
 void TestProtocol()
 {
     // Independent golden frames follow the paper's field order and PRT-based request IDs.
@@ -74,7 +101,12 @@ void TestProtocol()
     Throws([] { ReadHeader(Buffer{0xA0, 0}); });
     FrameStream limited(64);
     Throws([&] { limited.Feed(Buffer{0x8D, 0x7F, 0xFF, 0xFF, 0xFF}, [] (auto) {}); });
-    EMPY_CHECK(limited.Buffered() == 5);
+    EMPY_CHECK(limited.Buffered() == 0);
+    // Fragmented input buffers only the header before rejecting the advertised body.
+    FrameStream fragmented(64);
+    fragmented.Feed(Buffer{0x8D}, [] (auto) {});
+    Throws([&] { fragmented.Feed(Buffer{0x7F, 0xFF, 0xFF, 0xFF}, [] (auto) {}); });
+    EMPY_CHECK(fragmented.Buffered() == 5);
     FrameStream stream;
     size_t frames = 0;
     auto receive = [&] (auto bytes) { Codec::Decode(bytes); ++frames; };
@@ -106,7 +138,7 @@ void TestProtocol()
 
     ConnectionRequest connect;
     connect.resume = true;
-    connect.properties.auth = SessionAuth{"session", {0, 1, 2, 0xFF}};
+    connect.properties.auth = SessionAuth{"session", Buffer(32, 0xA5)};
     connect.properties.policy = SessionPolicy{true, EncodeInterval(3600), EncodeInterval(120), 65536};
     connect.properties.quic = QuicPolicy{MMQP_QUIC_STRATEGY_BULK, BulkPolicy{2, 4096}, 1200};
     connect.properties.will = SessionWill{Buffer{'o', 'n'}, Buffer{'o', 'f', 'f'}, "device/status", 1};
@@ -127,7 +159,12 @@ void TestProtocol()
         EMPY_CHECK((encoded[0] & 3) == type);
         EMPY_CHECK(Codec::Encode(Codec::Decode(encoded, {true}), {true}) == encoded);
     }
-    EMPY_CHECK(Codec::Encode(ConnectionSync{Buffer{0x11, 0x22}}) == Buffer({0x32, 3, 2, 0x11, 0x22}));
+    Buffer token(32, 0x11);
+    Buffer consyn{0x32, 33, 32};
+    consyn.insert(consyn.end(), token.begin(), token.end());
+    EMPY_CHECK(Codec::Encode(ConnectionSync{token}) == consyn);
+    Throws([] { Codec::Encode(ConnectionSync{Buffer{0x11, 0x22}}); });
+    Throws([] { Codec::Decode(Buffer{0x32, 3, 2, 0x11, 0x22}); });
     auto failure = Codec::Encode(ConnectionEnd{{0x80, "failure"}}, {true});
     EMPY_CHECK(std::get<ConnectionEnd>(Codec::Decode(failure, {true})).reason.text == "failure");
 
@@ -139,6 +176,34 @@ void TestProtocol()
     EMPY_CHECK(TopicMatches("$share/workers/room/#", "room/temp"));
     EMPY_CHECK(!TopicMatches("#", "$lwm/device"));
     EMPY_CHECK(TopicMatches("$lwm/#", "$lwm/device"));
+    EMPY_CHECK(MatchTopic("a/+/c", "a/b/c") && !MatchTopic("a/+/c", "a/b") && !MatchTopic("a/b", "a/b/c"));
+    EMPY_CHECK(MatchTopic("+/#", "a") && !MatchTopic("+", "$sys") && MatchTopic("$sys/+", "$sys/x"));
+    EMPY_CHECK(SplitShared("$share/g/a/#") == std::pair<std::string_view, std::string_view>("g", "a/#"));
+    {
+        // The trie must report exactly the filters the linear matcher accepts.
+        const std::vector<std::string> levels{"a", "b", "+", "#", "$s"};
+        std::vector<std::string> filters;
+        for (const auto& x : levels) for (const auto& y : levels) for (const auto& z : levels)
+            for (const auto& candidate : {x, x + "/" + y, x + "/" + y + "/" + z})
+            {
+                try { if (ParseTopic(candidate, true).filter == candidate) filters.push_back(candidate); }
+                catch (const ProtocolError&) {}
+            }
+        TopicTree<size_t> tree;
+        for (size_t i = 0; i < filters.size(); ++i) tree.Insert(filters[i], i);
+        for (const auto& topic : {"a", "b", "a/b", "a/b/a", "b/b/b", "$s", "$s/a", "a/$s", "$s/a/b"})
+        {
+            std::vector<size_t> found;
+            tree.Match(topic, [&] (size_t index) { found.push_back(index); });
+            std::sort(found.begin(), found.end());
+            std::vector<size_t> expected;
+            for (size_t i = 0; i < filters.size(); ++i) if (MatchTopic(filters[i], topic)) expected.push_back(i);
+            EMPY_CHECK(found == expected);
+            for (size_t i = 0; i < filters.size(); ++i) EMPY_CHECK(MatchTopic(filters[i], topic) == ReferenceMatch(filters[i], topic));
+        }
+        for (size_t i = 0; i < filters.size(); ++i) EMPY_CHECK(tree.Remove(filters[i], i));
+        EMPY_CHECK(tree.Size() == 0 && !tree.Remove("a", 0));
+    }
     for (auto invalid : {"a/#/b", "a/x+", "$share/g", "$share/+/a"})
         Throws([&] { ParseTopic(invalid, true); });
     EMPY_CHECK(!ValidUtf8(std::string("\xC0\xAF", 2)));
@@ -166,6 +231,64 @@ void TestProtocol()
     PacketSequence sequence;
     for (uint32_t i = 1; i <= UINT16_MAX; ++i) EMPY_CHECK(sequence.Next() == i);
     Throws([&] { sequence.Next(); });
+
+    // Publication PIDs wrap with serial-number arithmetic instead of exhausting the session.
+    EMPY_CHECK(WirePid(1) == 1 && WirePid(65535) == 65535 && WirePid(65536) == 1 && WirePid(131071) == 1);
+    EMPY_CHECK(PidAhead(65535, 1) == 1 && PidAhead(65536, 1) == 0 && PidAhead(2, 1) == 65534);
+    PublicationSequence outgoing(65534);
+    EMPY_CHECK(outgoing.Peek() == 65535 && outgoing.Next() == 65535 && outgoing.Next() == 1 && outgoing.Issued() == 65536);
+    EMPY_CHECK(outgoing.Sent(1) && outgoing.Sent(65535) && !outgoing.Sent(2) && !outgoing.Sent(0));
+    EMPY_CHECK(outgoing.Sequence(1) == 65536 && outgoing.Sequence(65535) == 65535);
+    EMPY_CHECK(!PublicationSequence{}.Sent(1) && !PublicationSequence(3).Sent(4));
+    Throws([&] { outgoing.Sequence(2); });
+
+    ReceiveWindow wrapped;
+    for (uint32_t i = 1; i <= 65535; ++i) wrapped.Commit(static_cast<uint16_t>(i));
+    EMPY_CHECK(wrapped.Checkpoint() == 65535 && wrapped.Inspect(1) == Reception::New);
+    EMPY_CHECK(wrapped.Inspect(65535) == Reception::Duplicate && wrapped.Inspect(40000) == Reception::Duplicate);
+    EMPY_CHECK(wrapped.Sequence(1) == 65536 && wrapped.Sequence(65000) == 65000);
+    wrapped.Commit(1);
+    EMPY_CHECK(wrapped.Checkpoint() == 65536 && wrapped.Inspect(1) == Reception::Duplicate && wrapped.Inspect(2) == Reception::New);
+    Throws([] { ReceiveWindow{}.Sequence(65000); });
+
+    // The 256-PID unordered window also spans the wrap, in any arrival order.
+    ReceiveWindow multiplexed(false);
+    for (uint32_t i = 1; i <= 65533; ++i) multiplexed.Commit(static_cast<uint16_t>(i));
+    multiplexed.Commit(1);
+    EMPY_CHECK(multiplexed.Checkpoint() == 65533 && multiplexed.Inspect(1) == Reception::Duplicate);
+    EMPY_CHECK(multiplexed.Inspect(65534) == Reception::New && multiplexed.Sequence(1) == 65536);
+    multiplexed.Commit(65535);
+    multiplexed.Commit(65534);
+    EMPY_CHECK(multiplexed.Checkpoint() == 65536);
+    EMPY_CHECK(multiplexed.Inspect(257) == Reception::New && multiplexed.Inspect(258) == Reception::OutsideWindow);
+    Throws([&] { multiplexed.Commit(258); });
+    Writer savedWindow;
+    multiplexed.Save(savedWindow);
+    Reader loadedWindow(savedWindow.Data());
+    EMPY_CHECK(ReceiveWindow::Load(loadedWindow).Checkpoint() == 65536);
+    Writer legacyWindow;
+    legacyWindow.U8(1);
+    legacyWindow.U16(256);
+    legacyWindow.U16(42);
+    for (size_t i = 0; i < 32; ++i) legacyWindow.U8(0);
+    Reader legacyReader(legacyWindow.Data());
+    EMPY_CHECK(ReceiveWindow::Load(legacyReader, true).Checkpoint() == 42);
+
+    // Pending publications stay in send order and admission stays bounded across the wrap.
+    PendingQueue inflight;
+    auto pending = [] (uint64_t position)
+    {
+        PublishRequest message;
+        message.alias = 1;
+        message.qos = 1;
+        message.packetId = WirePid(position);
+        return message;
+    };
+    for (uint64_t position : {65534ULL, 65535ULL, 65536ULL}) inflight.Add(pending(position), position, 1, TimePoint{}, TimePoint::max());
+    EMPY_CHECK(inflight.entries.begin()->second.message.packetId == 65534 && inflight.entries.rbegin()->second.message.packetId == 1);
+    EMPY_CHECK(inflight.CanAdd(1, 65534 + 255) && !inflight.CanAdd(1, 65534 + 256));
+    EMPY_CHECK(inflight.Remove(1) && !inflight.Remove(1) && inflight.entries.size() == 2 && inflight.Bytes() == 2);
+    Throws([&] { inflight.Add(pending(2), 3, 1, TimePoint{}, TimePoint::max()); });
 
     CorrelationIds correlations;
     correlations.Claim(UINT16_MAX);
@@ -201,17 +324,39 @@ void TestProtocol()
     PublishRequest telemetry;
     telemetry.alias = 1;
     telemetry.payload.resize(100);
-    EMPY_CHECK(plan.Select(telemetry, 110, 1200, 0) == QuicChannel::Datagram);
-    EMPY_CHECK(plan.Select(telemetry, 110, 50, 0) == QuicChannel::BestEffort);
+    std::vector<Buffer> encoded;
+    auto peek = [&] (const Message& message)
+    {
+        encoded.push_back(Codec::Encode(message, {true}));
+        return Codec::Peek(encoded.back(), {true});
+    };
+    EMPY_CHECK(plan.Select(peek(telemetry), 110, 1200, 0) == QuicChannel::Datagram);
+    EMPY_CHECK(plan.Select(peek(telemetry), 110, 50, 0) == QuicChannel::BestEffort);
     telemetry.qos = 1;
     telemetry.packetId = 1;
-    EMPY_CHECK(plan.Select(telemetry, 112, 1200, 0) == QuicChannel::Reliable);
-    Throws([&] { plan.Validate(QuicChannel::Datagram, telemetry, 112); });
+    EMPY_CHECK(plan.Select(peek(telemetry), 112, 1200, 0) == QuicChannel::Reliable);
+    Throws([&] { plan.Validate(QuicChannel::Datagram, peek(telemetry), 112); });
     telemetry.payload.resize(2048);
-    EMPY_CHECK(plan.Select(telemetry, 2060, 1200, 0) == QuicChannel::Bulk);
-    EMPY_CHECK(plan.Select(telemetry, 2060, 1200, 2) == QuicChannel::Reliable);
-    EMPY_CHECK(plan.Select(PublishAck{1, {}}, 5, 1200, 0) == QuicChannel::Control);
-    Throws([&] { plan.Validate(QuicChannel::Bulk, PublishAck{1, {}}, 5); });
+    EMPY_CHECK(plan.Select(peek(telemetry), 2060, 1200, 0) == QuicChannel::Bulk);
+    EMPY_CHECK(plan.Select(peek(telemetry), 2060, 1200, 2) == QuicChannel::Reliable);
+    EMPY_CHECK(plan.Select(peek(PublishAck{1, {}}), 5, 1200, 0) == QuicChannel::Control);
+    Throws([&] { plan.Validate(QuicChannel::Bulk, peek(PublishAck{1, {}}), 5); });
+    // The peek reports the same routing fields as a full decode for every PRT block.
+    for (auto type : {MMQP_PUBREQ_TYPE_MSG, MMQP_PUBREQ_TYPE_REQ, MMQP_PUBREQ_TYPE_RES})
+    {
+        PublishRequest routed;
+        routed.type = type;
+        routed.alias = 3;
+        routed.topic = "a/b";
+        routed.qos = 1;
+        routed.packetId = 9;
+        routed.correlationId = type == MMQP_PUBREQ_TYPE_MSG ? 0 : 4;
+        routed.reason = {MMQP_REASON_TIMEOUT, "late"};
+        routed.encryption = EncryptionHeader{};
+        routed.payload.resize(77);
+        auto packet = peek(routed);
+        EMPY_CHECK(packet.Publication() && packet.qos == 1 && packet.payload == 77 && packet.topic == "a/b");
+    }
     Throws([&] { QuicPlan invalid({MMQP_QUIC_STRATEGY_CUSTOM, {}, {}}); });
     Throws([&] { QuicPlan invalid({MMQP_QUIC_STRATEGY_SEMANTIC, BulkPolicy{}, {}}); });
     auto negotiated = QuicPlan::Negotiate(plan.Policy(), {MMQP_QUIC_STRATEGY_BULK, BulkPolicy{1, 4096}, 512});

@@ -1,3 +1,4 @@
+#include "Bench.h"
 #include <eClient/API.h>
 #include <charconv>
 #include <csignal>
@@ -10,6 +11,7 @@ namespace
 
 int32_t main(int32_t argc, char** argv)
 {
+    if (argc > 1 && std::string_view(argv[1]) == "bench") return RunBench(argc, argv);
     try
     {
         eMQ::ClientOptions options;
@@ -36,7 +38,12 @@ int32_t main(int32_t argc, char** argv)
             {
                 std::cout << "EmpyKlient publish|subscribe|request|respond TOPIC [PAYLOAD]\n"
                     << "  [--config FILE] [--host HOST] [--port PORT] [--qos 0|1] [--seconds N] [--count N] [--verbose]\n"
-                    << "  [--interval-ms N]  Pace repeated publications or requests\n";
+                    << "  [--interval-ms N]  Pace repeated publications or requests\n"
+                    << "EmpyKlient bench PREFIX --endpoints HOST:PORT[,HOST:PORT...] [--config FILE]\n"
+                    << "  --publishers P --subscribers S [--topics T] [--rate R] [--payload B] [--qos 0|1]\n"
+                    << "  [--seconds N] [--drain-ms D] [--offset K] [--verbose]\n"
+                    << "  Load generator; defaults P=1 S=1 T=1 R=10/s per publisher (0 = window-limited),\n"
+                    << "  B=64 (16..1048576), qos=1, N=30, D=3000, K=0; prints one JSON line on stdout\n";
                 return EXIT_SUCCESS;
             }
             if (!argument.starts_with("--")) { positional.emplace_back(argument); continue; }
