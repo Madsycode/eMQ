@@ -53,7 +53,7 @@ The dashboard serves the deployment at http://127.0.0.1:8080 until Ctrl+C or the
 | --- | --- |
 | `--brokers N` or `A,B,C` | Fabric size; a comma list runs a sweep and writes `sweep.json`/`sweep.md` |
 | `--traffic bench\|demo\|idle` | Load generators, the paced demo clients, or no clients |
-| `--publishers`, `--subscribers`, `--topics` | Bench clients, spread round-robin over all brokers; publisher *i* and subscriber *j* use topic `i mod T` / `j mod T` |
+| `--publishers`, `--subscribers`, `--topics` | Bench clients, spread round-robin over all brokers; publisher *i* and subscriber *j* use topic `i mod T` / `j mod T`, and subscribers are shifted by half the broker list so matching pairs use different brokers |
 | `--rate`, `--payload`, `--qos`, `--duration` | Publications per second per publisher (0 = unpaced), payload bytes (at least 16), QoS and send window |
 | `--shards`, `--replicas`, `--fanout`, `--lease-ms`, `--workers` | Fabric placement and broker settings (shards default to max(8, 2 × brokers)) |
 | `--bench-processes` | Load processes (default one per 200 clients); each owns its topic prefix |

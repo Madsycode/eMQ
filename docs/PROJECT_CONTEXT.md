@@ -41,20 +41,25 @@ Profiling under load drove these changes:
   a flushed file replacement, compacted into an atomic snapshot. A replica
   write fell from about 10 ms to 2.7 ms.
 
-Measured on this host (16 cores, one SSD), Release, TLS backplane, QoS 1, 128 B,
-20 publishers and 20 subscribers on 20 topics at 2 publications/s each:
+Measured on this host (Intel Core Ultra 7 255H, 16 cores, 64 GB, NVMe SSD,
+Windows 11 Pro), Release, TLS backplane, QoS 1, 128 B, 20 publishers and 20
+subscribers on 20 topics at 2 publications/s each, 30 s send window. The bench
+shifts subscribers by half the broker list, so each publisher and its subscriber
+use different brokers:
 
 | Brokers | Active links | Accepted/s | Delivered/s | Lost | Dup | p50 ms | p99 ms | Broker RSS MiB | Broker CPU % |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| 3 | 3 / 3 | 40.0 | 40.0 | 0 | 0 | 323.6 | 407.4 | 54 | 1.8 |
-| 10 | 45 / 45 | 40.0 | 40.0 | 0 | 0 | 173.8 | 251.2 | 171 | 2.7 |
-| 30 | 245 / 435 | 40.0 | 40.0 | 0 | 0 | 89.1 | 154.9 | 513 | 3.2 |
-| 100 | 362 / 4950 | 40.0 | 40.0 | 0 | 0 | 74.1 | 263.0 | 1513 | 5.0 |
+| 3 | 3 / 3 | 40.0 | 40.0 | 0 | 0 | 331.1 | 407.4 | 55 | 1.8 |
+| 10 | 45 / 45 | 40.0 | 40.0 | 0 | 0 | 177.8 | 251.2 | 171 | 3.2 |
+| 30 | 260 / 435 | 40.0 | 40.0 | 0 | 0 | 100.0 | 151.4 | 519 | 4.3 |
+| 100 | 360 / 4950 | 40.0 | 40.0 | 0 | 0 | 77.6 | 251.2 | 1510 | 5.8 |
 
-All 100 brokers listened within 1.9 s and reported within 0.2 s more. Ten brokers
-sustained about 96 reliable publications per second without loss (p50 186 ms)
-and saturated beyond that. Before these changes the same 10-broker run accepted
-about 1.5 per second. The remaining limit is architectural: each QoS 1
+All 100 brokers listened within 1.9 s and reported within 0.2 s more. With ten
+brokers, 100 offered publications per second gave 91.5 accepted per second
+without loss (p50 174 ms, p99 2.19 s); 8.5% were not admitted by the clients'
+in-flight and time budgets. At 200 offered per second only 35.3 were accepted.
+Before these changes a preliminary 10-broker run accepted about 1.5 per second
+at 400 offered, and 20.3 of 40 offered before the journaled store. The remaining limit is architectural: each QoS 1
 publication still waits synchronously on about six quorum round-trips inside the
 broker's single protocol thread, with CPU below 10%. An asynchronous admission
 pipeline, replica group commit and a per-topic retention owner are the next

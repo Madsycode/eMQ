@@ -275,13 +275,20 @@ int32_t RunBench(int32_t argc, char** argv)
             });
         }
 
+        // Publisher i and subscriber j start at the same rotation but subscribers are shifted
+        // by half the endpoint list, so matching pairs sit on different brokers.
+        auto Place = [&] (size_t c) -> const auto&
+        {
+            auto shift = c < publishers ? c : c - publishers + std::max<size_t>(1, endpoints.size() / 2);
+            return endpoints[(offset + shift) % endpoints.size()];
+        };
         auto connectStart = Clock::now();
         {
             std::vector<std::future<std::string>> connects;
             connects.reserve(total);
             for (size_t c = 0; c < total; ++c)
             {
-                const auto& endpoint = endpoints[(offset + c) % endpoints.size()];
+                const auto& endpoint = Place(c);
                 connects.push_back(clients[c]->AsyncConnect(endpoint.host, endpoint.port));
             }
             for (size_t c = 0; c < total; ++c)
@@ -289,7 +296,7 @@ int32_t RunBench(int32_t argc, char** argv)
                 try { connects[c].get(); }
                 catch (const std::exception& error)
                 {
-                    const auto& endpoint = endpoints[(offset + c) % endpoints.size()];
+                    const auto& endpoint = Place(c);
                     throw std::runtime_error("Bench client " + std::to_string(c) + " failed to connect to "
                         + endpoint.host + ":" + std::to_string(endpoint.port) + ": " + error.what());
                 }

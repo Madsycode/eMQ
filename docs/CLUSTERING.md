@@ -208,8 +208,10 @@ Measured reliable-path costs (10 brokers on one Windows host, one SSD, 2026-10-1
 a QoS 1 publication waits on about six quorum round-trips inside the broker's
 single protocol thread (inbox replication, session checkpoints, retained-queue
 lock, read, grant, adoption, write and index). With 20 publishers, one topic each,
-the fabric sustained 40 publications per second at 162 ms median latency and about
-96 per second at 186 ms with no loss, saturating beyond that with CPU below 10%.
+and every subscriber on a different broker than its publisher, the fabric carried
+40 publications per second at a 178 ms median without loss. At 100 offered per
+second it accepted 91.5 (p50 174 ms, p99 2.19 s) and at 200 only 35.3, with
+CPU below 10%.
 Shared topics published from several brokers contend for the retained-queue lock.
 The remaining ceiling is synchronous: an asynchronous admission pipeline (and
 replica group commit or a per-topic retention owner) is the next scalability step.
