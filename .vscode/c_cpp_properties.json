@@ -3,7 +3,6 @@
         {
             "includePath": [                                       
                 "${workspaceFolder}/EMPY_LIB_CLIENT/include",
-                "${workspaceFolder}/EMPY_LIB_CORE/include",
                 "${workspaceFolder}/EMPY_LIB_MQ/include",                
                 
                 "${workspaceFolder}/EMPY_IMPL_BROKER/src",
@@ -15,7 +14,7 @@
                 "C:/Libraries/**/include"
             ],  
             "configurationProvider": "ms-vscode.cmake-tools",  
-            "defines": ["EMPY_SHARED", "EMPY_LOGGING"],          
+            "defines": ["EMPY_LOGGING"],          
             "intelliSenseMode": "gcc-x64",
             "cppStandard": "c++20",
             "cStandard": "c17",

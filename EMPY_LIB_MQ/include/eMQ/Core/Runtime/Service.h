@@ -4,7 +4,7 @@
 #include <deque>
 
 
-namespace eCore
+namespace eMQ
 {      
     struct ImplService
     {   

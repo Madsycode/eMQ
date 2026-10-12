@@ -1,5 +1,5 @@
 #pragma once
-#include <eCore/API.h>
+#include <eMQ/Core/Runtime/Runtime.h>
 #include <eMQ/Common/Events.h>
 #include <eMQ/Network/Connection.h>
 #include "../Security/Payload.h"
@@ -35,7 +35,7 @@ namespace eMQ
 
     EMPY_CLIENT_API ClientOptions LoadClientOptions(const char* filename);
 
-    struct EMPY_CLIENT_API Client : eCore::ImplService
+    struct EMPY_CLIENT_API Client : eMQ::ImplService
     {
         explicit Client(ClientOptions options = {});
         explicit Client(const char* filename);
@@ -67,11 +67,11 @@ namespace eMQ
         
         std::future<Reason> Send(PublishRequest publication);
 
-        using eCore::ImplService::On;
-        using eCore::ImplService::Off;
+        using eMQ::ImplService::On;
+        using eMQ::ImplService::Off;
 
         template <typename _Event, typename _Callback>
-        eCore::Identt On(std::string topic, _Callback&& callback)
+        eMQ::Identt On(std::string topic, _Callback&& callback)
         {
             EMPY_STATIC((std::is_same_v<_Event, Receive> || std::is_same_v<_Event, Profile>));
             auto filter = CanonicalTopic(topic);
@@ -93,7 +93,7 @@ namespace eMQ
         }
 
         template <typename _Event>
-        void Off(eCore::Identt identt)
+        void Off(eMQ::Identt identt)
         {
             this->template OffEvent<_Event>(identt);
             auto entity = this->ToEntt(identt);

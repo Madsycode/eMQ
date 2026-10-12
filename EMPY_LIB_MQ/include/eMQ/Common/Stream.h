@@ -1,5 +1,5 @@
 #pragma once
-#include <eCore/Common/Core.h>
+#include <eMQ/Core/Common/Core.h>
 #include "Protocol.h"
 
 namespace eMQ

@@ -24,7 +24,7 @@ endif()
 
 # link others libraries
 target_link_libraries(${PROJECT_NAME} PUBLIC
-    ${EMPY_LIB_CORE} asio::asio
+    Threads::Threads asio::asio
     OpenSSL::Crypto OpenSSL::SSL
 )
 

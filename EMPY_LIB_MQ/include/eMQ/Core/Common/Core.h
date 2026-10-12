@@ -41,16 +41,6 @@
     #define EMPY_EXPORT __attribute__((visibility("default")))
     #define EMPY_IMPORT
 #endif
-#ifdef EMPY_SHARED
-    #define EMPY_API EMPY_EXPORT
-#else
-    #define EMPY_API EMPY_IMPORT
-#endif
-#ifdef EMPY_CORE_SHARED
-    #define EMPY_CORE_API EMPY_EXPORT
-#else
-    #define EMPY_CORE_API EMPY_IMPORT
-#endif
 #ifdef EMPY_MQ_SHARED
     #define EMPY_MQ_API EMPY_EXPORT
 #else
@@ -102,12 +92,12 @@
 // macros logging
 #ifdef EMPY_LOGGING
     #include "Log.h"
-    #define EMPY_TRACE(...) eCore::Trace(__VA_ARGS__)
-    #define EMPY_DEBUG(...) eCore::Debug(__VA_ARGS__)
-    #define EMPY_INFO(...)  eCore::Info(__VA_ARGS__)
-    #define EMPY_WARN(...)  eCore::Warn(__VA_ARGS__)
-    #define EMPY_ERROR(...) eCore::Error(__VA_ARGS__)
-    #define EMPY_FATAL(...) eCore::Fatal(__VA_ARGS__)
+    #define EMPY_TRACE(...) eMQ::Trace(__VA_ARGS__)
+    #define EMPY_DEBUG(...) eMQ::Debug(__VA_ARGS__)
+    #define EMPY_INFO(...)  eMQ::Info(__VA_ARGS__)
+    #define EMPY_WARN(...)  eMQ::Warn(__VA_ARGS__)
+    #define EMPY_ERROR(...) eMQ::Error(__VA_ARGS__)
+    #define EMPY_FATAL(...) eMQ::Fatal(__VA_ARGS__)
 #else
     #define EMPY_TRACE(...)
     #define EMPY_DEBUG(...)

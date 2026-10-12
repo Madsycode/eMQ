@@ -1,18 +1,18 @@
 @echo off
 setlocal EnableExtensions
 
-:: select configuration and keep compiler/toolchain outputs separate
+:: select the configuration; each one owns Targets\<Config> (Conan files, build tree, bin)
 set "EMPY_CONFIG=%~1"
 if "%EMPY_CONFIG%"=="" set "EMPY_CONFIG=Debug"
-if not "%EMPY_CONFIG%"=="Debug" if not "%EMPY_CONFIG%"=="Release" if not "%EMPY_CONFIG%"=="RelWithDebInfo" if not "%EMPY_CONFIG%"=="MinSizeRel" (
-    echo Usage: EmpyWin.bat Debug^|Release^|RelWithDebInfo^|MinSizeRel
+if not "%EMPY_CONFIG%"=="Debug" if not "%EMPY_CONFIG%"=="Release" (
+    echo Usage: EmpyWin.bat Debug^|Release
     exit /b 1
 )
 
 set "EMPY_GENERATOR=%CMAKE_GENERATOR%"
 if "%EMPY_GENERATOR%"=="" set "EMPY_GENERATOR=MinGW Makefiles"
-set "EMPY_CONAN=Targets\Conan-%EMPY_CONFIG%"
 set "EMPY_BUILD=Targets\%EMPY_CONFIG%"
+set "EMPY_CONAN=Targets\Conan"
 pushd "%~dp0"
 
 :: Keep Conan's MSYS build tools from shadowing the native MinGW compilers.

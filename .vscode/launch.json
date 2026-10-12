@@ -11,9 +11,9 @@
       "name": "EmpyBroker.exe",
       "preLaunchTask": "Debug",
       "externalConsole": false,
-      "cwd": "${workspaceFolder}/Targets/Build/Debug",
+      "cwd": "${workspaceFolder}/Targets/Debug/bin",
       "miDebuggerPath": "C:/msys64/ucrt64/bin/gdb.exe",
-      "program": "${workspaceFolder}/Targets/Build/Debug/EmpyBroker.exe",
+      "program": "${workspaceFolder}/Targets/Debug/bin/EmpyBroker.exe",
     },
     {
       "args": [],
@@ -24,9 +24,9 @@
       "name": "EmpyKlient.exe",
       "preLaunchTask": "Debug",
       "externalConsole": false,
-      "cwd": "${workspaceFolder}/Targets/Build/Debug",
+      "cwd": "${workspaceFolder}/Targets/Debug/bin",
       "miDebuggerPath": "C:/msys64/ucrt64/bin/gdb.exe",
-      "program": "${workspaceFolder}/Targets/Build/Debug/EmpyKlient.exe",
+      "program": "${workspaceFolder}/Targets/Debug/bin/EmpyKlient.exe",
     }
   ]
 }

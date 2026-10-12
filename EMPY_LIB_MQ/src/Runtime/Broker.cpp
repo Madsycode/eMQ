@@ -100,11 +100,11 @@ namespace eMQ
         BrokerOptions options;
         IoContext io;
         asio::steady_timer timer;
-        eCore::Registry registry;
-        std::map<std::string, eCore::Identt> sessions;
+        eMQ::Registry registry;
+        std::map<std::string, eMQ::Identt> sessions;
         // Local subscription index: candidates are re-checked against the session profile.
-        TopicTree<eCore::Identt> routes;
-        std::map<eCore::Identt, std::vector<std::string>> indexed;
+        TopicTree<eMQ::Identt> routes;
+        std::map<eMQ::Identt, std::vector<std::string>> indexed;
         std::map<uint64_t, std::shared_ptr<Peer>> peers;
         std::map<std::string, std::deque<Retained>> retained;
         std::map<std::pair<std::string, std::string>, size_t> sharedCursor;
@@ -580,7 +580,7 @@ namespace eMQ
             storage->Append("broker", writer.Data());
         }
 
-        void Unindex(eCore::Identt entity)
+        void Unindex(eMQ::Identt entity)
         {
             auto found = indexed.find(entity);
             if (found == indexed.end()) return;
@@ -605,7 +605,7 @@ namespace eMQ
             if (!filters.empty()) indexed.emplace(found->second, std::move(filters));
         }
 
-        void Destroy(std::map<std::string, eCore::Identt>::iterator session)
+        void Destroy(std::map<std::string, eMQ::Identt>::iterator session)
         {
             this->Unindex(session->second);
             registry.destroy(session->second);
@@ -1022,8 +1022,8 @@ namespace eMQ
 
         std::vector<Session*> Destinations(const PublishRequest& publication, bool responders)
         {
-            std::vector<eCore::Identt> candidates;
-            routes.Match(publication.topic, [&] (eCore::Identt entity) { candidates.push_back(entity); });
+            std::vector<eMQ::Identt> candidates;
+            routes.Match(publication.topic, [&] (eMQ::Identt entity) { candidates.push_back(entity); });
             std::sort(candidates.begin(), candidates.end());
             candidates.erase(std::unique(candidates.begin(), candidates.end()), candidates.end());
             auto now = Clock::now();

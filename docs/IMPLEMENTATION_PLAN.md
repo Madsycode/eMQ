@@ -6,7 +6,7 @@ paper's performance or availability results have been reproduced.
 
 ## Architecture and delivery order
 
-1. `EMPY_LIB_CORE` / `EmpyCore`: shared platform, events, entities, workers,
+1. `EMPY_LIB_MQ/include/eMQ/Core` (merged into `EmpyMQ` on 2026-10-12): shared platform, events, entities, workers,
    configuration and the Service / Context / Runtime / Module lifecycle.
 2. `EMPY_LIB_MQ` / `EmpyMQ`: shared MMQP wire format, transports, protocol state,
    broker services and reusable fabric primitives; links Core publicly.

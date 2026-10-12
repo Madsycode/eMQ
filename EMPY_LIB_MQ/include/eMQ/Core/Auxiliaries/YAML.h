@@ -5,7 +5,7 @@
 #include <limits>
 #include <type_traits>
 
-namespace eCore
+namespace eMQ
 {
     inline fkyaml::node LoadYAML(const char* filename)
     {

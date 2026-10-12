@@ -1,7 +1,7 @@
 #pragma once
 #include "Service.h"
 
-namespace eCore
+namespace eMQ
 {   
     template <typename _Service> struct ImplContext
     {

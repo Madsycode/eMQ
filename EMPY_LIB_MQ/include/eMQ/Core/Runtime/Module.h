@@ -1,7 +1,7 @@
 #pragma once
 #include "Context.h"
 
-namespace eCore
+namespace eMQ
 {   
     template <typename _Service, typename _Context> struct ImplModule
     {

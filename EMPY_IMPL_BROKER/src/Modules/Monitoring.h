@@ -4,7 +4,7 @@
 
 namespace eMQ
 {
-    struct Monitoring : eCore::ImplModule<Service, Context>
+    struct Monitoring : eMQ::ImplModule<Service, Context>
     {
         void OnAttach(Service*, Context*) override
         {

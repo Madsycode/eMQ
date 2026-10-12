@@ -1,5 +1,5 @@
 #pragma once
-#include <eCore/API.h>
+#include <eMQ/Core/Runtime/Runtime.h>
 #include "Common/Message.h"
 #include "Common/State.h"
 #include "Runtime/Broker.h"

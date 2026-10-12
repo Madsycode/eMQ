@@ -1,15 +1,15 @@
 #include "Checks.h"
-#include <eCore/API.h>
-#include <eCore/Auxiliaries/YAML.h>
+#include <eMQ/Core/Runtime/Runtime.h>
+#include <eMQ/Core/Auxiliaries/YAML.h>
 
 namespace
 {
     struct Event { int value = 0; };
-    struct Service : eCore::ImplService {};
-    struct Context : eCore::ImplContext<Service> {};
-    using Runtime = eCore::ImplCoreRuntime<Service, Context>;
+    struct Service : eMQ::ImplService {};
+    struct Context : eMQ::ImplContext<Service> {};
+    using Runtime = eMQ::ImplCoreRuntime<Service, Context>;
 
-    struct Module : eCore::ImplModule<Service, Context>
+    struct Module : eMQ::ImplModule<Service, Context>
     {
         int& received;
         int& detached;
@@ -22,7 +22,7 @@ namespace
         void OnDetach(Service*, Context*) override { ++detached; }
     };
 
-    struct SelfDetach : eCore::ImplModule<Service, Context>
+    struct SelfDetach : eMQ::ImplModule<Service, Context>
     {
         int& count;
         explicit SelfDetach(int& value): count(value) {}
@@ -70,8 +70,8 @@ void TestRuntime()
     EMPY_CHECK(bounded.TryDispatch([] {}, 10));
 
     auto config = fkyaml::node::deserialize("port: 65536\nnegative: -1\nvalid: 42\nfraction: 1.5\n");
-    Throws([&] { eCore::ReadYAML<uint16_t>(config, "port", 5600); });
-    Throws([&] { eCore::ReadYAML<uint32_t>(config, "negative", 0); });
-    Throws([&] { eCore::ReadYAML<uint16_t>(config, "fraction", 0); });
-    EMPY_CHECK(eCore::ReadYAML<uint8_t>(config, "valid", 0) == 42);
+    Throws([&] { eMQ::ReadYAML<uint16_t>(config, "port", 5600); });
+    Throws([&] { eMQ::ReadYAML<uint32_t>(config, "negative", 0); });
+    Throws([&] { eMQ::ReadYAML<uint16_t>(config, "fraction", 0); });
+    EMPY_CHECK(eMQ::ReadYAML<uint8_t>(config, "valid", 0) == 42);
 }

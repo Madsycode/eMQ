@@ -384,9 +384,9 @@ def run(args, count, directory, serve):
 def main(argv=None):
     root = Path(__file__).resolve().parents[1]
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--bin", type=Path, default=root / "Targets/BuildRelease/Release")
+    parser.add_argument("--bin", type=Path, default=root / "Targets/Release/bin")
     parser.add_argument("--openssl", default="openssl")
-    parser.add_argument("--output", type=Path, default=root / "Targets/Cluster")
+    parser.add_argument("--output", type=Path, default=root / "Targets/Runs/Cluster")
     parser.add_argument("--brokers", default="10", help="Broker count, or a comma list for a sweep (e.g. 3,10,30,100)")
     parser.add_argument("--quic", action="store_true", help="Use the native QUIC backplane instead of mutual TLS")
     parser.add_argument("--shards", type=int, default=0, help="Profile shards (default: max(8, 2 x brokers))")

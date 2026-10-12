@@ -13,8 +13,7 @@ C++20 implementation of the MMQP IoT-Communication framework. The broker and cli
 
 | Directory | Target | Responsibility |
 | --- | --- | --- |
-| `EMPY_LIB_CORE` | `EmpyCore`, shared | Generic ECS, events, workers, configuration and module lifecycle |
-| `EMPY_LIB_MQ` | `EmpyMQ`, shared | Wire protocol, transports, broker state, live fabric and durable storage |
+| `EMPY_LIB_MQ` | `EmpyMQ`, shared | Generic runtime (`eMQ/Core`: ECS, events, workers, configuration, module lifecycle), wire protocol, transports, broker state, live fabric and durable storage |
 | `EMPY_LIB_CLIENT` | `EmpyClient`, shared | Client session/API, payload encryption and key handling |
 | `EMPY_IMPL_BROKER` | `EmpyBroker`, executable | Broker configuration and monitoring module |
 | `EMPY_IMPL_CLIENT` | `EmpyKlient`, executable | Publish, subscribe, request and responder example |
@@ -22,13 +21,12 @@ C++20 implementation of the MMQP IoT-Communication framework. The broker and cli
 
 ```mermaid
 flowchart LR
-    Core[EmpyCore] --> MQ[EmpyMQ]
-    MQ --> Client[EmpyClient]
-    MQ --> Broker[EmpyBroker]
-    Client --> Example[EmpyKlient]
+    MQ[EmpyMQ.lib] --> Client[EmpyClient.lib]
+    MQ --> Broker[EmpyBroker.exe]
+    Client --> Example[EmpyKlient.exe]
 ```
 
-The arrows indicate public dependencies: MQ links Core, and Client links MQ. Core has no protocol or networking dependency. Broker protocol code belongs in MQ so applications can embed it without depending on the broker executable.
+The arrows indicate public dependencies: Client links MQ. The generic runtime headers under `eMQ/Core` have no protocol or networking dependency. Broker protocol code belongs in MQ so applications can embed it without depending on the broker executable.
 
 ## Build
 
@@ -45,23 +43,23 @@ EmpyWin.bat Release
 bash EmpyLinux.sh Debug
 ```
 
-The wrappers build all five targets and run CTest. They preserve user presets. Set `CMAKE_GENERATOR` to select another generator. Use separate build directories for different compilers, configurations or dependency toolchains. Alternatively, configure installed dependencies directly:
+The wrappers accept `Debug` or `Release`, build all four targets and the tests, and run CTest. Each configuration owns one directory: `Targets/<Config>` holds the Conan files (`Conan/`), the build tree and the ready-to-run binaries (`bin/`). Set `CMAKE_GENERATOR` to select another generator. Alternatively, configure installed dependencies directly:
 
 ```sh
-cmake -S . -B Targets/Build -DCMAKE_BUILD_TYPE=Debug \
+cmake -S . -B Targets/Debug -DCMAKE_BUILD_TYPE=Debug \
     -DEMPY_ASIO_INCLUDE_DIR=/path/to/asio/include \
     -DOPENSSL_ROOT_DIR=/path/to/openssl -DEMPY_ENABLE_QUIC=OFF
-cmake --build Targets/Build --parallel
-ctest --test-dir Targets/Build --output-on-failure
+cmake --build Targets/Debug --parallel
+ctest --test-dir Targets/Debug --output-on-failure
 ```
 
-For a multi-configuration generator, also pass `--config Debug` to the build and `-C Debug` to CTest. Outputs are under `<build-directory>/<configuration>`. Windows builds automatically stage project, OpenSSL, compiler and optional MsQuic runtime DLLs beside the executables, including transitive imports. A missing dependency fails the build. Use `EMPY_RUNTIME_DIRECTORIES` for additional DLL search directories; each executable has a SHA-256 `.runtime.txt` manifest. OpenSSL's enabled dynamic compression providers are included too: this local OpenSSL build needs `zlib1.dll`, which is absent from its normal PE import table `EMPY_RUNTIME_LIBRARIES` can add other explicitly runtime-loaded DLLs. Windows OS DLLs are supplied by Windows. Rebuilding also repairs deleted staged dependencies even when no executable relinks. See the project context for the exact commands verified on the author's machine.
+Outputs are under `<build-directory>/bin` (`bin/<configuration>` for a multi-configuration generator, which also needs `--config` and `-C`). Runtime staging is part of the root `CMakeLists.txt`, which also runs as the staging script. Windows builds automatically stage project, OpenSSL, compiler and optional MsQuic runtime DLLs beside the executables, including transitive imports. A missing dependency fails the build. Use `EMPY_RUNTIME_DIRECTORIES` for additional DLL search directories; each executable has a SHA-256 `.runtime.txt` manifest. OpenSSL's enabled dynamic compression providers are included too: this local OpenSSL build needs `zlib1.dll`, which is absent from its normal PE import table `EMPY_RUNTIME_LIBRARIES` can add other explicitly runtime-loaded DLLs. Windows OS DLLs are supplied by Windows. Rebuilding also repairs deleted staged dependencies even when no executable relinks. See the project context for the exact commands verified on the author's machine.
 
 QUIC is enabled by default in this checkout and requires MsQuic. Set
 `EMPY_ENABLE_QUIC=OFF` for a TCP/TLS-only build; it never silently falls back to TCP:
 
 ```sh
-cmake -S . -B Targets/Build -DEMPY_ENABLE_QUIC=ON \
+cmake -S . -B Targets/Debug -DEMPY_ENABLE_QUIC=ON \
     -DEMPY_MSQUIC_ROOT=/path/to/msquic
 ```
 
@@ -114,7 +112,7 @@ queues, request/response state and broker availability. Enable telemetry on each
 broker and run the collector from the repository root:
 
 ```sh
-Targets/Build/Debug/EmpyBroker --config Configs/BrokerDashboard.yaml
+Targets/Debug/bin/EmpyBroker --config Configs/BrokerDashboard.yaml
 python EMPY_DASHBOARD/app.py --config Configs/Dashboard.json
 ```
 
@@ -123,7 +121,7 @@ packages or frontend build step. For an isolated three-broker demo with real
 publishers, subscribers and RPC clients:
 
 ```sh
-python EMPY_DASHBOARD/demo.py --bin Targets/Build/Debug --openssl openssl
+python EMPY_DASHBOARD/demo.py --bin Targets/Debug/bin --openssl openssl
 ```
 
 To test clustering at scale, deploy 10 to 256 local brokers with generated
@@ -131,7 +129,7 @@ certificates, drive them with the built-in load generator and get a throughput,
 loss, latency and resource report. A comma list runs a sweep:
 
 ```sh
-python EMPY_DASHBOARD/cluster.py --brokers 100 --bin Targets/BuildRelease/Release --openssl openssl
+python EMPY_DASHBOARD/cluster.py --brokers 100 --bin Targets/Release/bin --openssl openssl
 python EMPY_DASHBOARD/cluster.py --brokers 3,10,30,100 --no-dashboard --rate 2 --openssl openssl
 ```
 

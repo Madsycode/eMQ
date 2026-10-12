@@ -1,5 +1,5 @@
 #pragma once
-#include <eCore/API.h>
+#include <eMQ/Core/Runtime/Runtime.h>
 #include "../Common/Events.h"
 #include "../Network/Connection.h"
 #include "../Cluster/Node.h"
@@ -49,7 +49,7 @@ namespace eMQ
 
     EMPY_MQ_API BrokerOptions LoadBrokerOptions(const char* filename);
 
-    struct EMPY_MQ_API Broker : eCore::ImplService
+    struct EMPY_MQ_API Broker : eMQ::ImplService
     {
         explicit Broker(BrokerOptions options = {});
         explicit Broker(const char* filename);

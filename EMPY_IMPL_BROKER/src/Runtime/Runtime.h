@@ -3,8 +3,8 @@
 
 namespace eMQ
 {
-    struct Runtime : eCore::ImplCoreRuntime<Service, Context>
+    struct Runtime : eMQ::ImplCoreRuntime<Service, Context>
     {
-        using eCore::ImplCoreRuntime<Service, Context>::ImplCoreRuntime;
+        using eMQ::ImplCoreRuntime<Service, Context>::ImplCoreRuntime;
     };
 }

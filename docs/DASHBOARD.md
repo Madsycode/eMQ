@@ -13,7 +13,7 @@ terminals. Substitute the appropriate build directory/configuration and add `.ex
 on Windows if the shell requires it.
 
 ```sh
-Targets/Build/Debug/EmpyBroker --config Configs/BrokerDashboard.yaml
+Targets/Debug/bin/EmpyBroker --config Configs/BrokerDashboard.yaml
 python EMPY_DASHBOARD/app.py --config Configs/Dashboard.json
 ```
 
@@ -33,8 +33,8 @@ this host, drives load and reports the result. `demo.py` is its three-broker
 preset with paced demo clients:
 
 ```sh
-python EMPY_DASHBOARD/demo.py --bin Targets/Build/Debug --openssl openssl --seconds 900
-python EMPY_DASHBOARD/cluster.py --brokers 10 --bin Targets/BuildRelease/Release --openssl openssl
+python EMPY_DASHBOARD/demo.py --bin Targets/Debug/bin --openssl openssl --seconds 900
+python EMPY_DASHBOARD/cluster.py --brokers 10 --bin Targets/Release/bin --openssl openssl
 python EMPY_DASHBOARD/cluster.py --brokers 100 --traffic idle --openssl openssl
 python EMPY_DASHBOARD/cluster.py --brokers 3,10,30,100 --no-dashboard --rate 2 --openssl openssl
 ```
@@ -204,7 +204,7 @@ availability results.
 
 Protocol observations and the bounded HTTP listener are in
 `EMPY_LIB_MQ/{include/eMQ,src}/Monitoring`. The library chain remains
-`Core <- MQ <- Client`. The Python collector and web server live in
+`MQ <- Client`. The Python collector and web server live in
 `EMPY_DASHBOARD/{collector,config,server,app}.py`; `cluster.py` deploys local
 fabrics, and the bench load generator is `EMPY_IMPL_CLIENT/src/Bench.cpp`. The UI is split into `app.js`
 (views), `model.js` (state/aggregation), `topology.js` (interactive SVG),
@@ -212,10 +212,10 @@ fabrics, and the bench load generator is `EMPY_IMPL_CLIENT/src/Bench.cpp`. The U
 Core or changes MMQP packets or persistent protocol schemas.
 
 ```sh
-ctest --test-dir Targets/Build --output-on-failure
+ctest --test-dir Targets/Debug --output-on-failure
 python -m unittest discover -s EMPY_DASHBOARD/tests -v
 node --test EMPY_DASHBOARD/tests/model.test.js
-python EMPY_DASHBOARD/tests/process_smoke.py --bin Targets/Build/Debug
+python EMPY_DASHBOARD/tests/process_smoke.py --bin Targets/Debug/bin
 ```
 
 Python and browser model tests are separate from the C++ build. Node is needed

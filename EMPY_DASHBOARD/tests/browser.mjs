@@ -4,7 +4,7 @@ import assert from "node:assert/strict";
 import { mkdir, writeFile } from "node:fs/promises";
 import path from "node:path";
 const { chromium } = await import(process.env.EMPY_PLAYWRIGHT_MODULE || "playwright");
-const output = path.resolve(process.env.EMPY_QA_OUTPUT || "Targets/DashboardQA");
+const output = path.resolve(process.env.EMPY_QA_OUTPUT || "Targets/Runs/DashboardQA");
 const url = process.env.EMPY_DASHBOARD_URL || "http://127.0.0.1:8080";
 await mkdir(output, { recursive: true });
 const browser = await chromium.launch({ headless: true,

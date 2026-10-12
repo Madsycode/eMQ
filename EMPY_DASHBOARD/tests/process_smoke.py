@@ -39,7 +39,7 @@ def main():
     root = Path(__file__).resolve().parents[2]
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--bin", required=True, type=Path)
-    parser.add_argument("--output", type=Path, default=root / "Targets/DashboardSmoke")
+    parser.add_argument("--output", type=Path, default=root / "Targets/Runs/DashboardSmoke")
     args = parser.parse_args()
     binary = args.bin.resolve()
     suffix = ".exe" if os.name == "nt" else ""
@@ -61,7 +61,9 @@ def main():
                 assert hashlib.sha256((binary / filename).read_bytes()).hexdigest() == digest, filename
                 checked += 1
         assert checked > 0, "No Windows runtime manifests found"
-        assert (binary / "zlib1.dll").is_file(), "OpenSSL's dynamic compression provider is missing"
+        # A dynamically linked OpenSSL loads its zlib provider at runtime; static (Conan) OpenSSL does not.
+        if (binary / "libcrypto-3-x64.dll").is_file():
+            assert (binary / "zlib1.dll").is_file(), "OpenSSL's dynamic compression provider is missing"
     config = directory / "broker.yaml"
     config.write_text("port: 0\ntelemetry:\n  port: 0\n  interval_ms: 250\n  token_env: EMPY_SMOKE_TELEMETRY\n", encoding="utf-8")
     with ExitStack() as cleanup:

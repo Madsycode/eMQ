@@ -13,4 +13,4 @@ from cluster import main, stop_process  # noqa: F401  stop_process is shared wit
 if __name__ == "__main__":
     root = Path(__file__).resolve().parents[1]
     sys.exit(main(["--brokers", "3", "--traffic", "demo", "--shards", "8", "--seconds", "900",
-                   "--bin", str(root / "Targets/Build/Debug"), "--output", str(root / "Targets/DashboardDemo"), *sys.argv[1:]]))
+                   "--bin", str(root / "Targets/Debug/bin"), "--output", str(root / "Targets/Runs/DashboardDemo"), *sys.argv[1:]]))

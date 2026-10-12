@@ -8,6 +8,49 @@ clustering and ECS-based runtime. The user's five-directory layering is binding.
 Use [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md) to locate each feature and
 [PROTOCOL_DECISIONS.md](PROTOCOL_DECISIONS.md) before changing wire behavior.
 
+## Merged runtime library and build layout, 2026-10-12
+
+The separate `EmpyCore` library is gone: its only consumer was `EmpyMQ`. The
+generic runtime headers moved to `EMPY_LIB_MQ/include/eMQ/Core/{Common,Runtime,
+Auxiliaries,Vendors}`, their namespace is now `eMQ`, and includes use
+`<eMQ/Core/...>`. The placeholder `EmpyCoreTag` and the unused `EMPY_API`,
+`EMPY_SHARED` and `EMPY_CORE_*` macros were removed, and the logger internals were
+renamed `LogLevel`, `LogWrite`, `g_LogLevel` and `g_LogMutex`. Vendored EnTT,
+fkYAML, Rang and task-pool headers are unchanged. The dependency chain is now
+`EmpyMQ <- EmpyClient`, plus the two executables and the tests.
+
+Windows runtime staging moved from `cmake/{Runtime,StageRuntime}.cmake` into the
+root `CMakeLists.txt`; the `cmake/` directory no longer exists. The generated
+`Runtime/<target>-<config>.cmake` files include the root file, which runs its
+staging block in CMake script mode and returns before `project()`.
+
+Builds use one directory per configuration, Debug and Release only:
+`Targets/<Config>/Conan` (Conan generators), the build tree, and
+`Targets/<Config>/bin` (executables, libraries and staged DLLs). The wrappers
+accept only `Debug` or `Release`. Run artifacts from the dashboard and cluster
+tools go to `Targets/Runs/<Tool>`, and the MsQuic OpenSSL runtime stays in
+`Targets/Dependencies`. Dated sections below describe earlier layouts
+(`Targets/Build`, `Targets/BuildRelease`, `Targets/BuildTcp`, `Targets/Conan-*`,
+`<build>/<config>` outputs); those directories and their evidence files no longer
+exist in this checkout.
+
+```powershell
+$env:PATH = 'C:\Libraries\msys64\ucrt64\bin;' + $env:PATH
+$env:EMPY_MSQUIC_ROOT = 'C:/Libraries/msquic'
+$env:EMPY_MSQUIC_RUNTIME = (Resolve-Path 'Targets/Dependencies/MsQuicOpenSSL/2.6.1/build/native/bin/x64/msquic.dll').Path
+.\EmpyWin.bat Debug
+.\EmpyWin.bat Release
+```
+
+Verified after the merge: both wrapper runs (Conan Asio 1.38.0 and static OpenSSL
+3.5.2, built once for Release) built every target without project warnings and
+passed 11/11 CTest suites. Debug took 36.31 s and Release 32.31 s; the only Release
+warnings come from OpenSSL's own sources. Dashboard tests passed (28 Python, 9
+JavaScript). `process_smoke.py` passed for `Targets/Debug/bin` and
+`Targets/Release/bin`; it now requires `zlib1.dll` only when a dynamic OpenSSL is
+staged. A 10-broker `cluster.py` run with the new default paths delivered 40
+publications per second without loss. Wrapper logs are in `Targets/Runs/Logs`.
+
 ## Scalable dashboard and local cluster tests, 2026-10-12
 
 F26/F27: `EMPY_DASHBOARD/cluster.py` deploys 1 to 256 real brokers on one host,
@@ -386,10 +429,10 @@ structural checks. No TeX compilation or visual verification is claimed.
   macros and `MMQP_*` protocol constants. Use `_Type` template parameters where
   consistent with the existing templates. Avoid global identifiers with new
   reserved underscore spellings.
-- Preserve `eCore` for generic framework code and `eMQ` for messaging/client
-  behavior. Existing bundled vendor headers keep their upstream formatting.
+- Keep generic framework code in `eMQ/Core` and messaging behavior in the rest
+  of `eMQ`; client behavior belongs to `eClient`. Existing bundled vendor headers keep their upstream formatting.
 - Components are plain state; services implement behavior. Do not import Asio,
-  MsQuic, protocol types or client encryption into the generic Core library.
+  MsQuic, protocol types or client encryption into the generic `eMQ/Core` headers.
 
 ## Initial inspection, 2026-09-18
 
@@ -415,8 +458,8 @@ to the Core event loop. Never mutate an EnTT registry from arbitrary pool jobs.
 
 | Area | Main files |
 | --- | --- |
-| Core lifecycle | `EMPY_LIB_CORE/include/eCore/Runtime/{Service,Context,Module,Runtime}.h` |
-| Entities/events/configuration | `eCore/Common/ECS.h`, `eCore/Auxiliaries/YAML.h` |
+| Core lifecycle | `EMPY_LIB_MQ/include/eMQ/Core/Runtime/{Service,Context,Module,Runtime}.h` |
+| Entities/events/configuration | `eMQ/Core/Common/ECS.h`, `eMQ/Core/Auxiliaries/YAML.h` |
 | Wire format and topic index | `EMPY_LIB_MQ/include/eMQ/Common/{Protocol,Stream,Message,Topic}.h` (`TopicTree`, `Codec::Peek`), matching `src/Common` files |
 | Protocol state | `eMQ/Common/State.h`, `src/Common/State.cpp`, `eMQ/Common/Events.h` |
 | TCP/TLS | `eMQ/Network/{Connection,IOContext}.h`, `src/Network/IOContext.cpp` |
@@ -429,7 +472,7 @@ to the Core event loop. Never mutate an EnTT registry from arbitrary pool jobs.
 | E2E | `eClient/Security/Payload.h`, `src/Security/Payload.cpp`, pinned `src/Vendors/Ascon` |
 | Fabric primitives | `eMQ/Cluster/{Fabric,Replication}.h`, matching `src/Cluster` files |
 | Live fabric and storage | `eMQ/Cluster/{Node,Storage,Clock}.h`, `src/Cluster/{Node,Storage}.cpp` |
-| Windows runtime packaging | `cmake/{Runtime,StageRuntime}.cmake`, per-executable `.runtime.txt` manifests |
+| Windows runtime packaging | Root `CMakeLists.txt` (`empy_stage_runtime` and its script-mode block), per-executable `.runtime.txt` manifests |
 | Executables | `EMPY_IMPL_BROKER/src/Serve.cpp`, `EMPY_IMPL_CLIENT/src/Client.cpp` |
 | Examples and tests | `Configs/*.yaml`, `Tests/*.cpp`, `Tests/Vectors/Ascon-AEAD128.txt` |
 
@@ -486,8 +529,9 @@ exactly-once business effects or reproduction of the paper's performance results
   epochs explicitly; do not log secrets or persist them in example YAML files.
 - Windows packaging must cover both PE imports and runtime-loaded providers.
   OpenSSL 3.5.2 here needs `zlib1.dll`; omitting it caused a reproducible null-call
-  crash in TLS certificate compression. `cmake/Runtime.cmake` checks enabled
-  dynamic compression providers, and `StageRuntime.cmake` stages their closure.
+  crash in TLS certificate compression. `empy_stage_runtime` in the root
+  `CMakeLists.txt` checks enabled dynamic compression providers, and its
+  script-mode block stages their closure.
   Preserve the minimal-PATH process smoke test; a normal developer PATH hid this.
 
 ## Verified environment and reproducible commands
@@ -643,7 +687,7 @@ $python = 'C:/Users/pouhela/.cache/codex-runtimes/codex-primary-runtime/dependen
     --openssl C:/Libraries/msys64/ucrt64/bin/openssl.exe
 ```
 
-The ready-to-run directories contain `EmpyCore.dll`, `EmpyMQ.dll`,
+The ready-to-run directories contain `EmpyMQ.dll`,
 `EmpyClient.dll`, OpenSSL's `libcrypto-3-x64.dll`/`libssl-3-x64.dll`,
 `libgcc_s_seh-1.dll`, `libstdc++-6.dll`, `libwinpthread-1.dll`, `zlib1.dll`
 and (QUIC builds) `msquic.dll`. Executable manifests record the actual imported

@@ -2,7 +2,7 @@
 #include "Core.h"
 #include "../Vendors/Entt.h"
 
-namespace eCore
+namespace eMQ
 {
     /// @brief entity identt
     using Identt = uint32_t;
