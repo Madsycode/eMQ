@@ -54,12 +54,12 @@ int main() { return 0; }" EMPY_OPENSSL_DYNAMIC_${algorithm})
     list(REMOVE_DUPLICATES dynamic)
     set(configuration "${CMAKE_BINARY_DIR}/Runtime/${target}-$<CONFIG>.cmake")
     file(GENERATE OUTPUT "${configuration}" CONTENT
-"set(EMPY_EXECUTABLE [==[$<TARGET_FILE:${target}>]==])
-set(EMPY_DLL_SEARCH [==[${search}]==])
-set(EMPY_DYNAMIC_DLLS [==[${dynamic}]==])
-set(EMPY_OBJDUMP [==[${CMAKE_OBJDUMP}]==])
-include([==[${CMAKE_SOURCE_DIR}/cmake/StageRuntime.cmake]==])
-")
+        "set(EMPY_EXECUTABLE [==[$<TARGET_FILE:${target}>]==])
+        set(EMPY_DLL_SEARCH [==[${search}]==])
+        set(EMPY_DYNAMIC_DLLS [==[${dynamic}]==])
+        set(EMPY_OBJDUMP [==[${CMAKE_OBJDUMP}]==])
+        include([==[${CMAKE_SOURCE_DIR}/cmake/StageRuntime.cmake]==])")
+
     add_custom_command(TARGET ${target} POST_BUILD
         COMMAND "${CMAKE_COMMAND}" -P "${configuration}" VERBATIM)
     # This also repairs a deleted dependency when the executable did not relink.

@@ -210,6 +210,51 @@ namespace
         }
     }
 
+    void SnapshotSchemas()
+    {
+        Fixture fixture;
+        BrokerOptions settings;
+        settings.port = 0;
+        settings.stateDirectory = (fixture.directory / "legacy-broker").string();
+        // A complete, empty schema-3 snapshot must fail before loading any state.
+        Buffer snapshot{'E', 'B', 'R', '3', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+        {
+            FileStore store(settings.stateDirectory);
+            store.Put("broker", snapshot);
+        }
+        Throws([&] { Broker legacy(settings); });
+        {
+            FileStore store(settings.stateDirectory);
+            EMPY_CHECK(store.Get("broker") == std::optional(snapshot));
+        }
+
+        auto options = fixture.Options(false).front();
+        Writer writer;
+        writer.U32(3);
+        writer.U64(options.fabric.epoch);
+        writer.U32(options.fabric.shards);
+        writer.U16(options.fabric.replicas);
+        writer.U16(options.fabric.fanout);
+        for (const auto& peer : options.peers)
+        {
+            writer.String(peer.identifier);
+            writer.String(peer.fingerprint);
+        }
+        auto digest = Sha256(writer.Data());
+        Buffer manifest(digest.begin(), digest.end());
+        { ClusterNode current(options); }
+        {
+            FileStore store(options.directory);
+            EMPY_CHECK(store.Get("manifest") != std::optional(manifest));
+            store.Put("manifest", manifest);
+        }
+        Throws([&] { ClusterNode legacy(options); });
+        {
+            FileStore store(options.directory);
+            EMPY_CHECK(store.Get("manifest") == std::optional(manifest));
+        }
+    }
+
     void PayloadState()
     {
         Fixture fixture;
@@ -497,6 +542,7 @@ namespace
 void TestRecovery()
 {
     Storage();
+    SnapshotSchemas();
     PayloadState();
     Standalone();
     Tenants();

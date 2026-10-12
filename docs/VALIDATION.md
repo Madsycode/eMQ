@@ -5,9 +5,15 @@ account, public endpoint or external messaging service is used in the tests.
 Network suites bind ephemeral loopback ports and create their own temporary test
 certificates; they do not modify the Windows trust store.
 
+The 2026-10-12 PRT-only request-ID revision passed all 11 suites in both Debug
+(`Targets/Debug`, Conan dependencies) and Release (`Targets/BuildRelease`,
+installed dependencies), with QUIC enabled. The added wire vectors and schema
+rejection checks are included below. Commands and compatibility details are in
+[PROJECT_CONTEXT.md](PROJECT_CONTEXT.md); logs are in `Targets/PrtRequestId`.
+
 | CTest suite | Features | Evidence |
 | --- | --- | --- |
-| `protocol` | F03-F05, F10-F11, F13, F15, F19 | Nine packet types and independent QoS 0/1 REQ/RES correlation golden frames; rejected legacy/COR/zero/truncated IDs; persisted ID allocation/exhaustion; RLF boundaries, fragmentation, invalid flags/UTF-8, TIE, profiles, PID/windows and QUIC policies |
+| `protocol` | F03-F05, F10-F11, F13, F15, F19 | Nine packet types and independent PRT-only QoS 0/1 REQ/RES golden frames; distinct request and packet IDs; rejected zero/truncated request IDs, missing request-count/response-reason fields, retired COR and other reserved bits; persisted ID allocation/exhaustion; RLF boundaries, fragmentation, invalid flags/UTF-8, TIE, profiles, PID/windows and QUIC policies |
 | `runtime` | F02, F26 | Independent runtimes, worker event dispatch, self-detach and cleanup, dispatch queue bounds and YAML integer range rejection |
 | `security` | F07, F16-F17 | All 1,089 official NIST Ascon-AEAD128 KAT cases, RFC 5869 HKDF and SHA vectors, delegation, epoch restrictions, AAD/tag/ciphertext alteration, replay and nonce exhaustion |
 | `integration` | F06-F18 | Real TCP broker and clients; retention/FIFO, resumption/offline queue, shared subscriptions, QoS filters, request/response, wills, E2E, TLS/HMAC and credential/hostname rejection |
@@ -15,7 +21,7 @@ certificates; they do not modify the Windows trust store.
 | `adversarial` | F03, F06-F11, F13-F14, F16, F18, F25 | Wrong first packet; oversized advertised frame; lost ACK/retry and duplicate suppression; conflicting PID reuse; transactional fan-out admission; keepalive expiry and stale SID; encrypted retention deduplication; broker-assigned alias reuse and tenant-scoped wills |
 | `correlation` | F04, F06, F13, F15-F16, F24 | Concurrent calls and equal CIDs across requester sessions; reverse replies with QoS 0/1, aliases and encrypted payloads; wrong topic/responder/ID and ID reuse rejection; no-responder/timeout IDs, resource bounds and late responses; standalone restart with both responder mappings and partially completed fan-out |
 | `quic` (optional build) | F06-F07, F11-F13, F19 | Real MsQuic traffic for SAS 1/4/3, QoS 0 datagrams and oversize fallback, concurrent bulk/reliable traffic, reconnects, wrong hostname/HMAC, mutual certificates and cancellation with outstanding sends |
-| `recovery` | F06-F07, F12-F17, F20-F25 | Atomic/exclusive/bounded storage and corruption rejection; cipher restart nonce/replay/epoch checks; standalone broker restart and eight-record replay with two in-flight credits; tenant isolation; three-node mutual-TLS ownership/takeover/minority refusal, shared subscriptions, request/response, SID failover and retained FIFO recovery |
+| `recovery` | F06-F07, F12-F17, F20-F25 | Atomic/exclusive/bounded storage and corruption rejection; rejection of prior broker/cluster schemas without modifying stored values; cipher restart nonce/replay/epoch checks; standalone broker restart and eight-record replay with two in-flight credits; tenant isolation; three-node mutual-TLS ownership/takeover/minority refusal, shared subscriptions, request/response, SID failover and retained FIFO recovery |
 | `fabric_quic` (optional build) | F19-F25 | The live three-node quorum and broker routing/restart scenarios over native mutual QUIC |
 | `monitoring` | F26 | Real broker/session packet counters, profile roles, disconnect/expiry observations, bounded session snapshots, JSON escaping and omission of payload/topic data; loopback/authentication/Host/Origin/method/header bounds; cancellation of a stalled HTTP reader |
 | `Tests/ClusterSmoke.py` (manual process test) | F01, F12-F14, F23-F24, F26 | Actual broker/client executables, minimal Windows PATH, cross-node delivery, forced primary termination, surviving-client failover, full-cluster termination/restart and retained replay |

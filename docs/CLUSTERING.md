@@ -144,14 +144,18 @@ per-resource quorum records. Active sessions checkpoint periodically; recovery
 expiry is conservative and includes the configured lease detection allowance.
 Broker restart resumption still requires the client's surviving session state.
 
-The correlation extension uses session format ESS3, standalone snapshot EBR3,
-request record ERQ1 and cluster manifest schema 3. It includes used-ID bitmaps,
-response mappings and partially completed request state. ESS2/EBR2 and manifest
-schema 2 cannot be loaded by this build. Upgrade all cluster members together:
+The PRT-based request-ID encoding uses session format ESS4, standalone snapshot
+EBR4, unchanged request metadata ERQ1 and cluster manifest schema 4. Sessions,
+inboxes and pending admissions embed wire publications; the new schema prevents
+mixing them with the previous COR-marked format. Used-ID bitmaps, response
+mappings and partially completed request state remain supported. ESS2/ESS3,
+EBR2/EBR3 and manifest schemas 2/3 cannot be loaded by this build.
+Upgrade all cluster members together:
 drain active work, preserve the old state as a backup, and use explicitly
 provisioned fresh state directories and fresh client SIDs, or implement and
 validate an offline migration first. No automatic migration, deletion or reset
-of existing state is performed. Wire RPC peers likewise need the COR extension.
+of existing state is performed. Wire RPC peers must all use PRT to select the
+mandatory request ID; the former COR bit must be zero.
 
 Retained replay has a bounded backlog separate from the in-flight window.
 PUBACK releases credit and continues replay in order. Configure

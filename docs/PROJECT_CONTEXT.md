@@ -8,6 +8,100 @@ clustering and ECS-based runtime. The user's five-directory layering is binding.
 Use [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md) to locate each feature and
 [PROTOCOL_DECISIONS.md](PROTOCOL_DECISIONS.md) before changing wire behavior.
 
+## PRT-selected request IDs, 2026-10-12
+
+F04/F15 now use the existing PRT values to determine the request-ID field.
+Every REQ (`PRT=2`) and RES (`PRT=3`) carries a nonzero, big-endian U16 request
+ID, including at QoS 0. The field follows the optional topic and QoS 1 packet
+ID, and precedes the request's response-count byte or response's reason block.
+It is independent of the QoS packet ID; MSG (`PRT=1`) carries no request ID.
+The `correlationId` API field, responder mappings and request matching are
+unchanged. `MMQP_PUBREQ_FLAGS_COR` was removed; bit `0x10` is reserved and must
+be zero. Packet lengths and ordinary MSG bytes are unchanged.
+
+Snapshots and inboxes contain encoded publications. This wire change therefore
+advances session snapshots to ESS4, broker snapshots to EBR4 and the cluster
+manifest to schema 4. Request metadata ERQ1 is unchanged. Old snapshots and
+cluster manifests fail before recovery and are preserved; there is no automatic
+migration or reset. Deploy matched clients and brokers, using fresh broker
+state or a separately validated offline migration. CONREQ remains version 1;
+pre-ID legacy payloads cannot always be distinguished from the mandatory ID
+and following header bytes. See [PROTOCOL_DECISIONS.md](PROTOCOL_DECISIONS.md)
+and [CLUSTERING.md](CLUSTERING.md) for the compatibility boundary.
+
+Validation passed with QUIC enabled: all targets built and all 11 CTest suites
+passed in both `Targets/Debug` (Debug, Conan dependencies) and
+`Targets/BuildRelease` (Release, installed dependencies). The protocol suite
+checks independent QoS 0/1 REQ/RES vectors, separate packet/request IDs, zero or
+truncated IDs and rejection of every reserved variable-header bit. Recovery
+checks also reject an intact EBR3 snapshot and a schema-3 cluster manifest
+without changing their stored values. Existing concurrent/encrypted RPC,
+standalone restart and TLS/QUIC cluster-failover tests passed.
+
+```powershell
+$env:PATH = 'C:\Libraries\msys64\ucrt64\bin;' + $env:PATH
+cmake --build Targets/Debug --parallel 2
+ctest --test-dir Targets/Debug --output-on-failure
+cmake --build Targets/BuildRelease --parallel 2
+ctest --test-dir Targets/BuildRelease --output-on-failure
+```
+
+Build and test logs are under ignored `Targets/PrtRequestId` as
+`debug-build.log`, `debug-tests.log`, `release-build.log` and `release-tests.log`.
+
+## Windows build repair, 2026-10-12
+
+F01 build setup now preserves the default `MinGW Makefiles` generator when
+`CMAKE_GENERATOR` is unset. `EmpyWin.bat` checks that native GCC, G++ and
+`mingw32-make` are on `PATH`, then passes their absolute compiler paths through
+Conan's `tools.build:compiler_executables`. Conan's bundled MSYS tools otherwise
+selected their POSIX GCC while building OpenSSL 3.5.2 for Windows, producing
+undeclared `wcslen`, `_alloca` and `wcscpy` errors. Pinning the native compilers
+addresses that toolchain mismatch without modifying vendor sources or pinned
+dependency versions. The wrapper also honors `CMAKE_BUILD_PARALLEL_LEVEL`.
+
+QUIC remains enabled by default, with Windows builds in `Targets/<configuration>`.
+The `EMPY_MSQUIC_ROOT` and `EMPY_MSQUIC_RUNTIME` environment
+variables now initialize their CMake cache entries on a fresh configuration.
+For an existing cache, use explicit `-D` values to change them. The installed
+Schannel MsQuic DLL compiles and links, but the PEM-based QUIC tests require the
+OpenSSL provider. The documented 2.6.1 package was restored under ignored
+`Targets/Dependencies/MsQuicOpenSSL` and its SHA-256 matched the value below.
+
+Local Windows wrapper command, from the repository root:
+
+```powershell
+$env:PATH = 'C:\Libraries\msys64\ucrt64\bin;' + $env:PATH
+$env:EMPY_MSQUIC_ROOT = 'C:/Libraries/msquic'
+$env:EMPY_MSQUIC_RUNTIME = (Resolve-Path 'Targets/Dependencies/MsQuicOpenSSL/2.6.1/build/native/bin/x64/msquic.dll').Path
+$env:CMAKE_BUILD_PARALLEL_LEVEL = '2'
+.\EmpyWin.bat Debug
+```
+
+The wrapper builds all libraries, executables and tests, and runs CTest. Its
+Debug binaries are under `Targets/Debug/Debug`; the separately configured
+installed-dependency Debug build is under `Targets/Build/Debug`.
+
+Verified with native MinGW GCC 15.2 and the OpenSSL MsQuic 2.6.1 runtime:
+
+| Build directory | Dependencies | Result |
+| --- | --- | --- |
+| `Targets/Debug` | Conan Asio 1.38.0 and static OpenSSL 3.5.2 | Complete wrapper run; all targets built; 11/11 CTest suites passed |
+| `Targets/Build` | Installed Asio 1.38.0 and shared OpenSSL 3.5.2 | All targets built; 11/11 CTest suites passed |
+| `Targets/BuildRelease` | Installed Asio 1.38.0 and shared OpenSSL 3.5.2 | All targets built; 11/11 CTest suites passed |
+
+Invalid configurations and a missing MinGW toolchain return exit code 1 before
+Conan runs. The Conan output passed all 17 runtime-manifest hash checks and
+broker/client `--help` startup with a Windows-only `PATH`. The installed Debug
+output passed `EMPY_DASHBOARD/tests/process_smoke.py`, including real pub/sub,
+telemetry and all 26 manifest entries with that minimal `PATH`. The Conan static
+OpenSSL build does not require the installed build's OpenSSL or zlib DLLs.
+
+The verified wrapper log is `Targets/BuildFix/wrapper-debug-verified.log`, the
+Release build/test log is `Targets/BuildFix/release.log`, and CTest keeps its
+logs in each build's `Testing/Temporary` directory. The executable smoke result
+is `Targets/BuildFix/Smoke/20261012-105135-bd3f60/result.json`.
+
 ## Web monitoring dashboard, 2026-09-29
 
 The requested dark dashboard is in `EMPY_DASHBOARD`. It is a separate read-only
@@ -90,12 +184,10 @@ $manuscriptPython = 'C:/Users/pouhela/.cache/codex-runtimes/codex-primary-runtim
 
 ## Correlated request/response, 2026-09-29
 
-The author requested a two-byte correlation field and an update confined to the
-manuscript's Request/Response subsection. REQ and RES now carry a nonzero,
-big-endian U16 `correlationId` under variable-header flag `COR=0x10`, after the
-optional QoS 1 PID and before the request-count/response-reason block. QoS 0
-also carries the ID; ordinary MSG bytes are unchanged. Legacy RPC packets are
-rejected, and old codecs reject COR instead of misreading the extra bytes.
+The initial two-byte correlation implementation used `COR=0x10` on REQ and RES.
+The 2026-10-12 revision above removes that redundant flag and selects the same
+mandatory field through PRT. The ID's byte order and position, QoS 0 support,
+API and exchange-matching behavior remain as described below.
 
 Exchanges are keyed by requester SID/CID, not topic. Each responder receives its
 own mapped CID; routing restores the requester's ID and verifies the canonical
@@ -115,11 +207,10 @@ Responders use `Respond(event.message, payload)` or
 `Respond(topic, correlationId, payload, reason, qos)`. The ambiguous topic-only
 overload was removed, and all executable/test call sites were updated.
 
-New storage markers are ESS3/EBR3/ERQ1 and cluster manifest schema 3. Existing
-schema-2 directories are rejected without alteration; coordinated fresh-state
-deployment or a separately validated offline migration is required. CID remains
-broker routing metadata outside the topic/epoch payload AAD. Read the decisions
-and clustering guides before changing either boundary.
+The initial storage markers ESS3/EBR3 and cluster manifest schema 3 are superseded
+by ESS4/EBR4 and schema 4 for the PRT-only wire format; ERQ1 is unchanged. CID
+remains broker routing metadata outside the topic/epoch payload AAD. Read the
+decisions and clustering guides before changing either boundary.
 
 Only the Request/Response subsection of `docs/latex/MMQP.tex` was changed for
 this feature. Its preceding 37,722 bytes and following 82,112 bytes are unchanged
@@ -195,7 +286,7 @@ adds live routing, ownership/failover and persistence. Read
 | F01-F02 | Shared dependency chain repaired; owner-thread ECS/event dispatch, lifecycle and module cleanup implemented |
 | F03-F05 | Nine typed packet codecs, bounded incremental framing, strict fields/topics/UTF-8 and exact TIE conversion implemented |
 | F06-F11 | Session state machines, resumption, HMAC, negotiated limits, keepalive, wills, atomic profiles and directional aliases implemented |
-| F12-F15 | Local/cross-broker pub/sub and shared groups, QoS checkpoints/retries, FIFO/last retention, bounded replay, and concurrent correlated request/response with durable requester/responder mappings implemented |
+| F12-F15 | Local/cross-broker pub/sub and shared groups, QoS checkpoints/retries, FIFO/last retention, bounded replay, and concurrent request/response with PRT-selected IDs and durable requester/responder mappings implemented |
 | F16-F17 | NIST Ascon-AEAD128, HMAC/HKDF, delegated keys, epoch/cache wiping, nonces/replay windows and optional durable cipher state implemented; hardware key services are deployment integrations |
 | F18 | Asynchronous TCP and TLS 1.3 implemented and tested with real sockets |
 | F19 | Optional MsQuic transport with SAS 1/4/3, datagrams, bulk streams and verified credentials implemented; custom SAS 0 and broader platform/path testing remain |
@@ -428,5 +519,5 @@ were not executed on this Windows/MinGW validation run.
    Cipher state must never be cloned or rolled back; it stores no payload key.
 4. Extend fault qualification to Linux/MSVC, long partitions, slow disks,
    suspend/resume and clock perturbation; preserve raw evidence.
-5. Qualify the COR extension with independent peers and define future CID/PID
+5. Qualify the PRT-based request-ID encoding with independent peers and define future CID/PID
    rollover, server-freshness authentication and capability/version negotiation.

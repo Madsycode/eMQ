@@ -124,7 +124,7 @@ namespace eMQ
         uint8_t qos = 0;
         uint16_t packetId = 0;
         bool duplicate = false;
-        uint16_t correlationId = 0;
+        uint16_t correlationId = 0; // Mandatory for PRT REQ/RES, independent of the QoS packet ID.
         uint8_t responses = 1;
         Reason reason;
         std::optional<EncryptionHeader> encryption;

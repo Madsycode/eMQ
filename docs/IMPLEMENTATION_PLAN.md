@@ -40,7 +40,7 @@ for the verified implementation status and commands.
 | F12 | Pub/sub and shared subscriptions; I-A, I-D1, I-E | MQ/Runtime, Client | Route only to eligible profiles, preserve the paper's QoS filter, select one member per shared group and suppress overlapping local matches. Test real TCP publisher/subscriber exchange and subscriber disconnect. |
 | F13 | QoS and retransmissions; I-E2, Table 13 | MQ/Common, MQ/Runtime, Client | Ordered checkpoint, unordered receive window, original PID and DUP on retry, bounded outstanding sends and retry deadlines. Do not wrap the 16-bit PID. Test lost ACKs, out-of-order arrivals, duplicates, queue saturation and exhaustion. Durable application exactly-once effects require transactional application storage. |
 | F14 | Retention and expiry; I-D2 | MQ/Runtime | Retain only QoS 1 publications; implement last-value and bounded FIFO policies, per-message expiry and replay to new eligible subscriptions. Test queue eviction, expiry, memory admission and QoS 0 exclusion. |
-| F15 | Request/response; I-E1 and the author's correlation extension | MQ/Common, MQ/Runtime, Client | Carry a mandatory nonzero big-endian U16 CID under the COR flag for QoS 0/1 REQ and RES. Match exchanges by requester SID/CID and canonical topic; map IDs per responder session to handle equal IDs from different requesters. Preserve IDs through retries, no-responder results, timeouts, partial multi-responder completion and session recovery. Bound active state and never reuse IDs in a SID. Verify same-topic concurrency, reverse replies, invalid/reused IDs, lost ACKs, exhaustion, encrypted traffic and clustered requester/responder failover. |
+| F15 | Request/response; I-E1 and the author's request-ID extension | MQ/Common, MQ/Runtime, Client | PRT REQ/RES alone selects a mandatory nonzero big-endian U16 CID at QoS 0/1, separate from the QoS packet ID. Keep the former COR bit reserved and zero. Match exchanges by requester SID/CID and canonical topic; map IDs per responder session to handle equal IDs from different requesters. Preserve IDs through retries, no-responder results, timeouts, partial multi-responder completion and session recovery. Bound active state and never reuse IDs in a SID. Verify same-topic concurrency, reverse replies, invalid/reused IDs, lost ACKs, exhaustion, encrypted traffic and clustered requester/responder failover. |
 | F16 | E2E encryption and hierarchy; II, Table 14 | Client/Security; crypto helpers in MQ | Vendor a pinned official Ascon reference, use a maintained SHA-256/HMAC provider, define HKDF salt/info/length, derive topic/epoch keys and support delegated subtree keys. Use random-prefix/counter nonces and canonical topic plus epoch as AAD. Verify published KATs, hierarchy boundaries, altered topic/epoch/tag/ciphertext and plaintext non-release on failure. |
 | F17 | Key lifecycle and replay policy; II-C,D,F,G | Client/Security | Bound and wipe key caches; separate auth and payload keys; reject epochs outside policy and nonce/counter exhaustion. Provision secrets outside the broker. Persistent anti-replay and hardware-backed keys need explicit deployment integration. |
 | F18 | TCP asynchronous transport; V-B2 | MQ/Network | Repeated accepts, bounded reads/writes, owned buffers, serialized callbacks, connect deadlines and orderly worker shutdown. Keep networking out of Core. Test fragmentation, multiple clients, abrupt close and oversized frames. |
@@ -63,10 +63,11 @@ visible. A research reference implementation is not a substitute for multi-node
 failure testing, a security review or wire interoperability testing with another
 implementation.
 
-F15 now specifies and implements the author's two-byte correlation extension.
-The COR flag provides explicit packet-level discrimination, while ESS3/EBR3 and
-cluster manifest schema 3 reject incompatible stored state. Mixed-version RPC
-and an independent peer implementation remain interoperability work.
+F15 implements a two-byte request ID selected exclusively by PRT REQ/RES.
+ESS4/EBR4 and cluster manifest schema 4 reject incompatible stored state, and
+the former COR bit is rejected as reserved. Pre-ID payloads cannot always be
+distinguished from the new header by inspection. Matched RPC peers are required;
+mixed-version negotiation and independent interoperability remain future work.
 
 ## Delivered integration, 2026-09-29
 
@@ -97,7 +98,7 @@ and must remain visible in later work.
 
 | Step | Implementation | Acceptance and future reference |
 | --- | --- | --- |
-| F26.1 Observations | Typed process-local broker/session counters, queue/profile/ownership snapshots, actual authenticated peer links, instance and cluster manifest identities, local record-byte accounting | Sample on each owning executor. Preserve MMQP bytes and ESS3/EBR3 state. Counters omit secrets/payloads and state their send-admission/reset boundary. |
+| F26.1 Observations | Typed process-local broker/session counters, queue/profile/ownership snapshots, actual authenticated peer links, instance and cluster manifest identities, local record-byte accounting | Sample on each owning executor. Preserve MMQP bytes and ESS4/EBR4 state. Counters omit secrets/payloads and state their send-admission/reset boundary. |
 | F26.2 Telemetry | Opt-in loopback HTTP endpoint with optional environment-sourced bearer token; independent sampler and shared bounded cache | Enforce header/connection/deadline/session/response bounds, GET-only routes, Host/Origin checks and deterministic shutdown before the broker. A stalled sample remains detectably stale. |
 | F26.3 Collection | Standard-library Python collector, explicit bounded source list, verified HTTPS or local/tunneled HTTP, schema allowlist, histories and restart-safe deltas | Isolate source errors, reject redirects, exclude stale counters from totals, mark unknown client state, preserve last observations and bound memory history. |
 | F26.4 Web views | Dark responsive HTML/CSS/ES modules: live SVG topology, traffic charts, inventory, session search/filter/pagination/detail, activity/export, pause and refresh | Verify actual broker/client data, topology link changes, filters, export, desktop/mobile layout, empty/error states and no browser errors. Keep user-controlled text out of HTML interpolation. |

@@ -50,14 +50,15 @@ The wrappers build all five targets and run CTest. They preserve user presets. S
 ```sh
 cmake -S . -B Targets/Build -DCMAKE_BUILD_TYPE=Debug \
     -DEMPY_ASIO_INCLUDE_DIR=/path/to/asio/include \
-    -DOPENSSL_ROOT_DIR=/path/to/openssl
+    -DOPENSSL_ROOT_DIR=/path/to/openssl -DEMPY_ENABLE_QUIC=OFF
 cmake --build Targets/Build --parallel
 ctest --test-dir Targets/Build --output-on-failure
 ```
 
 For a multi-configuration generator, also pass `--config Debug` to the build and `-C Debug` to CTest. Outputs are under `<build-directory>/<configuration>`. Windows builds automatically stage project, OpenSSL, compiler and optional MsQuic runtime DLLs beside the executables, including transitive imports. A missing dependency fails the build. Use `EMPY_RUNTIME_DIRECTORIES` for additional DLL search directories; each executable has a SHA-256 `.runtime.txt` manifest. OpenSSL's enabled dynamic compression providers are included too: this local OpenSSL build needs `zlib1.dll`, which is absent from its normal PE import table `EMPY_RUNTIME_LIBRARIES` can add other explicitly runtime-loaded DLLs. Windows OS DLLs are supplied by Windows. Rebuilding also repairs deleted staged dependencies even when no executable relinks. See the project context for the exact commands verified on the author's machine.
 
-QUIC is optional and never silently falls back to TCP:
+QUIC is enabled by default in this checkout and requires MsQuic. Set
+`EMPY_ENABLE_QUIC=OFF` for a TCP/TLS-only build; it never silently falls back to TCP:
 
 ```sh
 cmake -S . -B Targets/Build -DEMPY_ENABLE_QUIC=ON \
@@ -65,6 +66,15 @@ cmake -S . -B Targets/Build -DEMPY_ENABLE_QUIC=ON \
 ```
 
 MsQuic must provide its public API v2 headers, import library and runtime. On Windows, `EMPY_MSQUIC_RUNTIME` can select a particular `msquic.dll`, which CMake copies next to the targets. The OpenSSL build accepts PEM credentials. A Schannel build requires `certificate_hash` referencing an existing credential in the Windows Current User certificate store. Empy does not install certificates or private keys in that store. The configuration and tests here use PEM files with Microsoft's [MsQuic OpenSSL package](https://www.nuget.org/packages/Microsoft.Native.Quic.MsQuic.OpenSSL).
+
+For `EmpyWin.bat`, put the native MinGW `bin` directory on `PATH` before running
+Conan. The wrapper checks for GCC, G++ and `mingw32-make`, then passes the compiler
+paths to Conan so its MSYS tools cannot select a POSIX GCC instead. Set
+`EMPY_MSQUIC_ROOT` and, for the PEM-based QUIC tests, `EMPY_MSQUIC_RUNTIME` in the
+environment before the first configuration. These initialize the corresponding
+CMake cache entries; existing builds use their cached values or explicit `-D`
+overrides. The Windows wrapper writes binaries to `Targets/<configuration>/<configuration>`.
+See the project context for the verified local paths and commands.
 
 ## Run the examples
 
@@ -168,7 +178,7 @@ the broker's PUBACK. Neither future waits for application responses.
 - A QoS 0 subscription receives only QoS 0 publications. QoS 1 receives both.
 - REG QoS selects retention: 0 is last value, 1 is bounded FIFO. Only QoS 1 publications are retained. `Register(topic, 1, expirySeconds, queueSize)` selects FIFO; the default selects last value.
 - Wildcards use complete `+` levels or terminal `#`. Shared subscriptions use `$share/<group>/<filter>`. Ordinary root wildcards exclude reserved `$` topics.
-- Requests on the same topic run concurrently using a two-byte CID in QoS 0/1 REQ and RES. IDs are nonzero and never reused within a SID; exhaustion requires a fresh session. No-responder and timeout results preserve the originating CID. COR-aware peers are required; ordinary MSG encoding is unchanged. Persistent schema upgrade requirements are in [CLUSTERING.md](docs/CLUSTERING.md).
+- PRT REQ/RES alone selects the mandatory two-byte request ID (`correlationId`) at QoS 0/1, independently of the QoS packet ID. The former COR bit is reserved and must be zero. Requests on the same topic run concurrently; IDs are nonzero and never reused within a SID, and exhaustion requires a fresh session. No-responder and timeout results preserve the originating ID. Deploy matched peers; ordinary MSG encoding is unchanged. Persistent schema upgrade requirements are in [CLUSTERING.md](docs/CLUSTERING.md).
 - Publication and profile PIDs never wrap. Establish a fresh session after 65,535 operations in a PID namespace. Alias namespaces are also finite.
 - A PUBACK confirms bounded protocol acceptance. Application callbacks and durable business transactions are separate. A durable broker checkpoint does not make an application's external side effects exactly once.
 - The cipher uses a bounded 256-counter replay window per topic, epoch and random publisher prefix. A very late unseen envelope outside that window is rejected. Nonce/replay state persists only when its state directory is enabled.

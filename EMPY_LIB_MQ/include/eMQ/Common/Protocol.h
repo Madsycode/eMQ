@@ -90,7 +90,6 @@ inline constexpr _byte_ MMQP_PROREQ_TYPE_SUB = 0x40;
 inline constexpr _byte_ MMQP_PUBREQ_FLAGS_DUP = 0x80;
 inline constexpr _byte_ MMQP_PUBREQ_FLAGS_E2E = 0x40;
 inline constexpr _byte_ MMQP_PUBREQ_FLAGS_TOP = 0x20;
-inline constexpr _byte_ MMQP_PUBREQ_FLAGS_COR = 0x10;
 inline constexpr _byte_ MMQP_PUBREQ_TYPE_MASK = 0x03;
 inline constexpr _byte_ MMQP_PUBREQ_TYPE_RES = 0x03;
 inline constexpr _byte_ MMQP_PUBREQ_TYPE_REQ = 0x02;

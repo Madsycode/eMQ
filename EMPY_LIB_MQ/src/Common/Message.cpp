@@ -295,8 +295,7 @@ namespace eMQ
             writer.U16(request.alias);
             writer.U8((request.duplicate ? MMQP_PUBREQ_FLAGS_DUP : 0)
                 | (request.encryption ? MMQP_PUBREQ_FLAGS_E2E : 0)
-                | (request.topic.empty() ? 0 : MMQP_PUBREQ_FLAGS_TOP)
-                | (correlated ? MMQP_PUBREQ_FLAGS_COR : 0) | request.qos);
+                | (request.topic.empty() ? 0 : MMQP_PUBREQ_FLAGS_TOP) | request.qos);
             if (!request.topic.empty()) writer.String(ParseTopic(request.topic).filter);
             if (request.qos) writer.U16(request.packetId);
             if (correlated) writer.U16(request.correlationId);
@@ -318,10 +317,8 @@ namespace eMQ
             request.alias = reader.U16();
             Require(request.alias != 0, "Publication alias must be nonzero", MMQP_REASON_INVALID_ALIAS);
             auto flags = reader.U8();
-            Flags(flags, 0xF3);
+            Flags(flags, 0xE3);
             bool correlated = type == MMQP_PUBREQ_TYPE_REQ || type == MMQP_PUBREQ_TYPE_RES;
-            Require(correlated == ((flags & MMQP_PUBREQ_FLAGS_COR) != 0), "Invalid correlation header flag",
-                MMQP_REASON_INVALID_CORRELATION);
             request.qos = flags & MMQP_QOS_LEVEL_MASK;
             request.duplicate = flags & MMQP_PUBREQ_FLAGS_DUP;
             Qos(request.qos);

@@ -221,7 +221,7 @@ namespace eMQ
         Buffer SaveSession(const Session& session)
         {
             Writer writer(options.maxStateBytes);
-            writer.U32(0x45535333);
+            writer.U32(0x45535334);
             writer.String(session.identifier);
             writer.String(session.realm);
             ConnectionRequest request;
@@ -291,7 +291,7 @@ namespace eMQ
         Session LoadSession(std::span<const uint8_t> bytes)
         {
             Reader reader(bytes);
-            if (reader.U32() != 0x45535333) throw ProtocolError("Unknown session snapshot version; correlation IDs require ESS3");
+            if (reader.U32() != 0x45535334) throw ProtocolError("Unknown session snapshot version; PRT-based request IDs require ESS4");
             Session session;
             session.identifier = reader.String();
             session.realm = reader.String();
@@ -428,7 +428,7 @@ namespace eMQ
         Buffer Snapshot()
         {
             Writer writer(options.maxStateBytes);
-            writer.U32(0x45425233);
+            writer.U32(0x45425234);
             writer.U32(static_cast<uint32_t>(sessions.size()));
             for (const auto& [id, entity] : sessions) WriteBuffer(writer, this->SaveSession(registry.get<Session>(entity)));
             writer.U32(static_cast<uint32_t>(retained.size()));
@@ -450,7 +450,7 @@ namespace eMQ
         void Restore(const Buffer& bytes)
         {
             Reader reader(bytes);
-            if (reader.U32() != 0x45425233) throw ProtocolError("Unknown broker snapshot version; correlation IDs require EBR3");
+            if (reader.U32() != 0x45425234) throw ProtocolError("Unknown broker snapshot version; PRT-based request IDs require EBR4");
             auto count = reader.U32();
             if (count > options.maxSessions) throw ProtocolError("Stored sessions exceed configured budget");
             for (uint32_t i = 0; i < count; ++i)

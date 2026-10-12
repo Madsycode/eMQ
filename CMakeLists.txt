@@ -1,9 +1,9 @@
 cmake_minimum_required(VERSION 3.20 FATAL_ERROR)
 project(Empy VERSION 0.1.0 LANGUAGES C CXX)
 
-set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
+set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_C_STANDARD 99)
 
 if (NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
@@ -16,10 +16,11 @@ set(CMAKE_LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/$<CONFIG>")
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/$<CONFIG>")
 
 option(EMPY_BUILD_TESTS "Build protocol and integration tests" ON)
-option(EMPY_ENABLE_QUIC "Build the optional MsQuic transport" OFF)
+option(EMPY_ENABLE_QUIC "Build the optional MsQuic transport" ON)
+
+set(EMPY_MSQUIC_RUNTIME "$ENV{EMPY_MSQUIC_RUNTIME}" CACHE FILEPATH "Optional MsQuic DLL, matching TLS provider")
 set(EMPY_ASIO_INCLUDE_DIR "" CACHE PATH "Standalone Asio include directory")
-set(EMPY_MSQUIC_ROOT "" CACHE PATH "MsQuic installation directory")
-set(EMPY_MSQUIC_RUNTIME "" CACHE FILEPATH "Optional MsQuic runtime DLL, matching the selected TLS provider")
+set(EMPY_MSQUIC_ROOT "$ENV{EMPY_MSQUIC_ROOT}" CACHE PATH "MsQuic installation directory")
 include(cmake/Runtime.cmake)
 
 function(configure_project_target target)

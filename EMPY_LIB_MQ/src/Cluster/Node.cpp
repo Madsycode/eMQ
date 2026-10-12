@@ -134,7 +134,7 @@ namespace eMQ
             if (members.size() != fabric.Options().brokers.size() || !members.contains(options.identifier))
                 throw std::invalid_argument("Cluster endpoints must describe the complete configured membership");
             Writer writer(65536);
-            writer.U32(3); // Persistent backplane value schema, including correlated RPC sessions.
+            writer.U32(4); // Persistent backplane value schema, with request IDs selected by PRT.
             writer.U64(fabric.Options().epoch);
             writer.U32(fabric.Options().shards);
             writer.U16(fabric.Options().replicas);
@@ -148,7 +148,7 @@ namespace eMQ
             manifest = Sha256(writer.Data());
             if (auto previous = store.Get("manifest"))
             {
-                if (!SecureEqual(*previous, manifest)) throw std::invalid_argument("State directory belongs to another membership/epoch; migrate it explicitly");
+                if (!SecureEqual(*previous, manifest)) throw std::invalid_argument("State directory belongs to another schema/membership/epoch; migrate it explicitly");
                 // A restarted voter cannot remember a monotonic lease deadline.
                 bootGuard = LeaseClock::now() + std::chrono::milliseconds(options.leaseMilliseconds);
             }

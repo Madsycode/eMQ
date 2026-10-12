@@ -5,7 +5,7 @@ using namespace eMQ;
 
 void TestProtocol()
 {
-    // Independent golden frames transcribed from the paper's field order.
+    // Independent golden frames follow the paper's field order and PRT-based request IDs.
     std::vector<std::pair<Message, Buffer>> golden{
         {ConnectionRequest{}, {0x10, 0x07, 0x04, 'M', 'M', 'Q', 'P', 0x01, 0x00}},
         {ConnectionAck{}, {0x20, 0x02, 0x00, 0x00}},
@@ -27,19 +27,32 @@ void TestProtocol()
     publication.type = MMQP_PUBREQ_TYPE_REQ;
     publication.correlationId = 0x1234;
     publication.responses = 2;
-    golden.emplace_back(publication, Buffer{0x82, 0x0B, 0x00, 0x02, 0x31, 0x01, 'x', 0x00, 0x07, 0x12, 0x34, 0x02, 0xAA});
+    golden.emplace_back(publication, Buffer{0x82, 0x0B, 0x00, 0x02, 0x21, 0x01, 'x', 0x00, 0x07, 0x12, 0x34, 0x02, 0xAA});
     publication.type = MMQP_PUBREQ_TYPE_RES;
-    golden.emplace_back(publication, Buffer{0x83, 0x0B, 0x00, 0x02, 0x31, 0x01, 'x', 0x00, 0x07, 0x12, 0x34, 0x00, 0xAA});
+    golden.emplace_back(publication, Buffer{0x83, 0x0B, 0x00, 0x02, 0x21, 0x01, 'x', 0x00, 0x07, 0x12, 0x34, 0x00, 0xAA});
     publication.qos = 0;
     publication.packetId = 0;
     publication.topic.clear();
-    golden.emplace_back(publication, Buffer{0x83, 0x07, 0x00, 0x02, 0x10, 0x12, 0x34, 0x00, 0xAA});
+    golden.emplace_back(publication, Buffer{0x83, 0x07, 0x00, 0x02, 0x00, 0x12, 0x34, 0x00, 0xAA});
     publication.type = MMQP_PUBREQ_TYPE_REQ;
-    golden.emplace_back(publication, Buffer{0x82, 0x07, 0x00, 0x02, 0x10, 0x12, 0x34, 0x02, 0xAA});
+    golden.emplace_back(publication, Buffer{0x82, 0x07, 0x00, 0x02, 0x00, 0x12, 0x34, 0x02, 0xAA});
     for (const auto& [message, bytes] : golden)
     {
         EMPY_CHECK(Codec::Encode(message) == bytes);
         EMPY_CHECK(Codec::Encode(Codec::Decode(bytes)) == bytes);
+        if (auto expected = std::get_if<PublishRequest>(&message))
+        {
+            auto decoded = std::get<PublishRequest>(Codec::Decode(bytes));
+            EMPY_CHECK(decoded.type == expected->type && decoded.qos == expected->qos);
+            EMPY_CHECK(decoded.packetId == expected->packetId && decoded.correlationId == expected->correlationId);
+            EMPY_CHECK(decoded.payload == expected->payload);
+            for (auto reserved : {0x10, 0x08, 0x04})
+            {
+                auto invalid = bytes;
+                invalid[4] |= reserved;
+                Throws([&] { Codec::Decode(invalid); });
+            }
+        }
         for (size_t count = 0; count < bytes.size(); ++count)
             Throws([&] { Codec::Decode(std::span(bytes).first(count)); });
         auto extra = bytes;
@@ -73,14 +86,20 @@ void TestProtocol()
     stream.Feed(batch, receive);
     EMPY_CHECK(frames == golden.size() * 2);
 
-    Throws([] { Codec::Decode(Buffer{0x82, 4, 0, 1, 0, 1}); }); // Legacy request without COR.
-    Throws([] { Codec::Decode(Buffer{0x83, 4, 0, 1, 0, 0}); }); // Legacy response without COR.
-    Throws([] { Codec::Decode(Buffer{0x81, 5, 0, 1, 0x10, 0, 1}); }); // COR on MSG.
-    Throws([] { Codec::Decode(Buffer{0x82, 6, 0, 1, 0x10, 0, 0, 1}); }); // CID zero.
-    Throws([] { Codec::Decode(Buffer{0x82, 4, 0, 1, 0x10, 1}); }); // Truncated CID.
-    Throws([] { Codec::Decode(Buffer{0x82, 6, 0, 1, 0x18, 0, 1, 1}); }); // Remaining reserved bit.
-    publication.correlationId = 0;
-    Throws([&] { Codec::Encode(publication); });
+    for (uint8_t type : {MMQP_PUBREQ_TYPE_REQ, MMQP_PUBREQ_TYPE_RES})
+    {
+        auto control = static_cast<uint8_t>(0x80 | type);
+        // Complete frames with missing/truncated IDs, missing type-specific data, or zero IDs.
+        for (const auto& invalid : {
+            Buffer{control, 3, 0, 1, 0}, Buffer{control, 4, 0, 1, 0, 1},
+            Buffer{control, 5, 0, 1, 0, 0, 1}, Buffer{control, 6, 0, 1, 0, 0, 0, 0},
+            Buffer{control, 5, 0, 1, 1, 0, 7}, Buffer{control, 6, 0, 1, 1, 0, 7, 1},
+            Buffer{control, 7, 0, 1, 1, 0, 7, 0, 1}, Buffer{control, 8, 0, 1, 1, 0, 7, 0, 0, 0}})
+            Throws([&] { Codec::Decode(invalid); });
+        publication.type = type;
+        publication.correlationId = 0;
+        Throws([&] { Codec::Encode(publication); });
+    }
     publication.type = MMQP_PUBREQ_TYPE_MSG;
     publication.correlationId = 1;
     Throws([&] { Codec::Encode(publication); });

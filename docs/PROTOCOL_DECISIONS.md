@@ -17,15 +17,17 @@ The original `Protocol.h` contains older constants that disagree with the paper.
   control bits with values 1/2/3; DUP is `0x80` of its variable flags byte.
 - Session flags are SAF/SPF/QPF/SWF/TPF = `80/40/20/10/08` (hex).
   Profile operation mask is `0xC0`; QoS 2 and 3 are rejected.
-- The 2026-09-29 request/response extension assigns PUBREQ variable-header flag
-  bit 4 (`0x10`, `COR`) to a mandatory nonzero U16 correlation ID on REQ and RES.
-  In both QoS levels, the ID follows the optional topic and QoS 1 PID, before
+- As requested on 2026-10-12, PRT alone selects the mandatory nonzero U16 request
+  ID (`correlationId` in the API): REQ (`PRT=2`) and RES (`PRT=3`) always carry it,
+  including at QoS 0. It follows the optional topic and QoS 1 packet ID, before
   REQ's response-count byte or RES's reason block. Byte order is big endian.
-  MSG must omit COR and the ID; its encoding is unchanged. Other reserved bits
-  remain rejected. CONREQ stays at version 1: the COR flag makes legacy codecs
-  reject extended RPC packets rather than misinterpret shifted fields. Updated
-  codecs reject unmarked legacy RPC. Deploy matched brokers and clients; no
-  capability negotiation or mixed-version RPC interoperability is claimed.
+  The request ID identifies the exchange independently of the QoS packet ID.
+  MSG (`PRT=1`) omits the request ID and keeps its existing encoding.
+  The former COR bit (`0x10`) is reserved again and must be zero; COR-marked
+  packets are rejected. CONREQ stays at version 1. Pre-ID legacy payload bytes
+  can resemble a valid request header, so missing IDs cannot always identify an
+  old peer. Deploy matched brokers and clients; no format guessing, capability
+  negotiation or mixed-version RPC interoperability is provided.
 - Reason strings appear after a nonzero reason iff IRS is negotiated. This
   includes `0x80`, which the prose's strict inequality accidentally omits.
   The initial code's reason registry is retained; missing codes are explicit
@@ -87,8 +89,10 @@ The original `Protocol.h` contains older constants that disagree with the paper.
   original deadline. Expired exchanges release their directory leases even
   when delivery of the timeout notification is backpressured.
   Both requester and responder state follow their SIDs through resumption.
-  The new persistent formats are ESS3, EBR3, ERQ1 and backplane manifest schema 3;
-  prior state is rejected rather than guessed or silently migrated.
+  Persistent sessions and broker snapshots embed these wire packets, so the
+  PRT-only encoding uses ESS4, EBR4 and backplane manifest schema 4. ERQ1's
+  separately stored request metadata is unchanged. Prior snapshot/manifest
+  schemas are rejected rather than guessed or silently migrated.
 - Wills use the paper's `$bwm/` and `$lwm/` prefixes. A missing will suffix is
   the SID. The paper describes LWM for disconnection generally, so clean and
   unclean disconnections both publish it once.

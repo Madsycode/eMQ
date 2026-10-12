@@ -18,18 +18,14 @@ target_include_directories(${PROJECT_NAME} PUBLIC
 
 # link window libraries
 if (WIN32)
-    target_link_libraries(${PROJECT_NAME} PUBLIC
-        ws2_32
-        mswsock
-    )
+    target_link_libraries(${PROJECT_NAME} PUBLIC 
+        ws2_32 mswsock)
 endif()
 
 # link others libraries
 target_link_libraries(${PROJECT_NAME} PUBLIC
-    ${EMPY_LIB_CORE}
-    asio::asio
-    OpenSSL::Crypto
-    OpenSSL::SSL
+    ${EMPY_LIB_CORE} asio::asio
+    OpenSSL::Crypto OpenSSL::SSL
 )
 
 if (EMPY_ENABLE_QUIC)
